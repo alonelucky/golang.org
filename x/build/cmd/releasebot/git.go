@@ -25,11 +25,16 @@ func (w *Work) gitCheckout() {
 		w.log.Panic(err)
 	}
 
+	origin := "https://go.googlesource.com/go"
+	if w.Security {
+		origin = "sso://team/golang/go-private"
+	}
+
 	// Check out a local mirror to work-mirror, to speed future checkouts for this point release.
 	mirror := filepath.Join(w.Dir, "gitmirror")
 	r := w.runner(mirror)
 	if _, err := os.Stat(mirror); err != nil {
-		w.runner(w.Dir).run("git", "clone", "https://go.googlesource.com/go", mirror)
+		w.runner(w.Dir).run("git", "clone", origin, mirror)
 		r.run("git", "config", "gc.auto", "0") // don't throw away refs we fetch
 	} else {
 		r.run("git", "fetch", "origin", "master")
@@ -41,7 +46,7 @@ func (w *Work) gitCheckout() {
 	if err := os.RemoveAll(gitDir); err != nil {
 		w.log.Panic(err)
 	}
-	w.runner(w.Dir).run("git", "clone", "--reference", mirror, "-b", w.ReleaseBranch, "https://go.googlesource.com/go", gitDir)
+	w.runner(w.Dir).run("git", "clone", "--reference", mirror, "-b", w.ReleaseBranch, origin, gitDir)
 	r = w.runner(gitDir)
 	r.run("git", "codereview", "change", "relwork")
 	r.run("git", "config", "gc.auto", "0") // don't throw away refs we fetch
@@ -60,6 +65,7 @@ func (w *Work) gitTagVersion() {
 		out := r.runOut("git", "rev-parse", w.Version)
 		w.VersionCommit = strings.TrimSpace(string(out))
 		w.log.Printf("Git tag already exists (%s), resuming release.", w.VersionCommit)
+		return
 	}
 	out := r.runOut("git", "rev-parse", "HEAD")
 	w.VersionCommit = strings.TrimSpace(string(out))
@@ -83,4 +89,11 @@ func (w *Work) gitTagVersion() {
 		return
 	}
 	r.run("git", "push", "origin", w.Version)
+}
+
+// gitHeadCommit returns the hash of the HEAD commit.
+func (w *Work) gitHeadCommit() string {
+	r := w.runner(filepath.Join(w.Dir, "gitwork"))
+	out := r.runOut("git", "rev-parse", "HEAD")
+	return strings.TrimSpace(string(out))
 }

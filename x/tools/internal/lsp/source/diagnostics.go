@@ -5,30 +5,30 @@
 package source
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"go/token"
 	"strconv"
 	"strings"
+
+	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/tests"
 
 	"golang.org/x/tools/go/packages"
 )
 
 type Diagnostic struct {
-	Range    Range
-	Severity DiagnosticSeverity
-	Message  string
+	Range
+	Message string
+	Source  string
 }
 
-type DiagnosticSeverity int
-
-const (
-	SeverityError DiagnosticSeverity = iota
-	SeverityWarning
-	SeverityHint
-	SeverityInformation
-)
-
-func Diagnostics(ctx context.Context, v *View, f *File) (map[string][]Diagnostic, error) {
+func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic, error) {
+	f, err := v.GetFile(ctx, uri)
+	if err != nil {
+		return nil, err
+	}
 	pkg, err := f.GetPackage()
 	if err != nil {
 		return nil, err
@@ -56,25 +56,75 @@ func Diagnostics(ctx context.Context, v *View, f *File) (map[string][]Diagnostic
 		diags = parseErrors
 	}
 	for _, diag := range diags {
-		filename, start := v.errorPos(diag)
-		// TODO(rstambler): Add support for diagnostic ranges.
-		end := start
+		pos := errorPos(diag)
+		diagFile, err := v.GetFile(ctx, ToURI(pos.Filename))
+		if err != nil {
+			continue
+		}
+		diagTok, err := diagFile.GetToken()
+		if err != nil {
+			continue
+		}
+		content, err := diagFile.Read()
+		if err != nil {
+			continue
+		}
+		end, err := identifierEnd(content, pos.Line, pos.Column)
+		// Don't set a range if it's anything other than a type error.
+		if err != nil || diag.Kind != packages.TypeError {
+			end = 0
+		}
+		startPos := fromTokenPosition(diagTok, pos.Line, pos.Column)
+		if !startPos.IsValid() {
+			continue
+		}
+		endPos := fromTokenPosition(diagTok, pos.Line, pos.Column+end)
+		if !endPos.IsValid() {
+			continue
+		}
 		diagnostic := Diagnostic{
 			Range: Range{
-				Start: start,
-				End:   end,
+				Start: startPos,
+				End:   endPos,
 			},
-			Message:  diag.Msg,
-			Severity: SeverityError,
+			Message: diag.Msg,
 		}
-		if _, ok := reports[filename]; ok {
-			reports[filename] = append(reports[filename], diagnostic)
+		if _, ok := reports[pos.Filename]; ok {
+			reports[pos.Filename] = append(reports[pos.Filename], diagnostic)
 		}
 	}
+	if len(diags) > 0 {
+		return reports, nil
+	}
+	// Type checking and parsing succeeded. Run analyses.
+	runAnalyses(pkg, func(a *analysis.Analyzer, diag analysis.Diagnostic) {
+		pos := pkg.Fset.Position(diag.Pos)
+		category := a.Name
+		if diag.Category != "" {
+			category += "." + category
+		}
+
+		reports[pos.Filename] = append(reports[pos.Filename], Diagnostic{
+			Source:  category,
+			Range:   Range{Start: diag.Pos, End: diag.Pos},
+			Message: fmt.Sprintf(diag.Message),
+		})
+	})
+
 	return reports, nil
 }
 
-func (v *View) errorPos(pkgErr packages.Error) (string, token.Pos) {
+// fromTokenPosition converts a token.Position (1-based line and column
+// number) to a token.Pos (byte offset value). This requires the token.File
+// to which the token.Pos belongs.
+func fromTokenPosition(f *token.File, line, col int) token.Pos {
+	linePos := lineStart(f, line)
+	// TODO: This is incorrect, as pos.Column represents bytes, not characters.
+	// This needs to be handled to address golang.org/issue/29149.
+	return linePos + token.Pos(col-1)
+}
+
+func errorPos(pkgErr packages.Error) token.Position {
 	remainder1, first, hasLine := chop(pkgErr.Pos)
 	remainder2, second, hasColumn := chop(remainder1)
 	var pos token.Position
@@ -86,15 +136,7 @@ func (v *View) errorPos(pkgErr packages.Error) (string, token.Pos) {
 		pos.Filename = remainder1
 		pos.Line = first
 	}
-	f := v.GetFile(ToURI(pos.Filename))
-	if f == nil {
-		return "", token.NoPos
-	}
-	tok, err := f.GetToken()
-	if err != nil {
-		return "", token.NoPos
-	}
-	return pos.Filename, fromTokenPosition(tok, pos)
+	return pos
 }
 
 func chop(text string) (remainder string, value int, ok bool) {
@@ -109,40 +151,51 @@ func chop(text string) (remainder string, value int, ok bool) {
 	return text[:i], int(v), true
 }
 
-// fromTokenPosition converts a token.Position (1-based line and column
-// number) to a token.Pos (byte offset value).
-// It requires the token file the pos belongs to in order to do this.
-func fromTokenPosition(f *token.File, pos token.Position) token.Pos {
-	line := lineStart(f, pos.Line)
-	return line + token.Pos(pos.Column-1) // TODO: this is wrong, bytes not characters
+// identifierEnd returns the length of an identifier within a string,
+// given the starting line and column numbers of the identifier.
+func identifierEnd(content []byte, l, c int) (int, error) {
+	lines := bytes.Split(content, []byte("\n"))
+	if len(lines) < l {
+		return 0, fmt.Errorf("invalid line number: got %v, but only %v lines", l, len(lines))
+	}
+	line := lines[l-1]
+	if len(line) < c {
+		return 0, fmt.Errorf("invalid column number: got %v, but the length of the line is %v", c, len(line))
+	}
+	return bytes.IndexAny(line[c-1:], " \n,():;[]"), nil
 }
 
-// this functionality was borrowed from the analysisutil package
-func lineStart(f *token.File, line int) token.Pos {
-	// Use binary search to find the start offset of this line.
-	//
-	// TODO(adonovan): eventually replace this function with the
-	// simpler and more efficient (*go/token.File).LineStart, added
-	// in go1.12.
-
-	min := 0        // inclusive
-	max := f.Size() // exclusive
-	for {
-		offset := (min + max) / 2
-		pos := f.Pos(offset)
-		posn := f.Position(pos)
-		if posn.Line == line {
-			return pos - (token.Pos(posn.Column) - 1)
+func runAnalyses(pkg *packages.Package, report func(a *analysis.Analyzer, diag analysis.Diagnostic)) error {
+	analyzers := []*analysis.Analyzer{
+		tests.Analyzer, // an analyzer that doesn't have facts or requires
+	}
+	for _, a := range analyzers {
+		if len(a.FactTypes) > 0 {
+			panic("for analyzer " + a.Name + " modular analyses needing facts are not yet supported")
 		}
-
-		if min+1 >= max {
-			return token.NoPos
+		if len(a.Requires) > 0 {
+			panic("for analyzer " + a.Name + " analyses requiring results are not yet supported")
 		}
+		pass := &analysis.Pass{
+			Analyzer: a,
 
-		if posn.Line < line {
-			min = offset
-		} else {
-			max = offset
+			Fset:       pkg.Fset,
+			Files:      pkg.Syntax,
+			OtherFiles: pkg.OtherFiles,
+			Pkg:        pkg.Types,
+			TypesInfo:  pkg.TypesInfo,
+			TypesSizes: pkg.TypesSizes,
+
+			Report: func(diagnostic analysis.Diagnostic) { report(a, diagnostic) },
+
+			// TODO(matloob): Fill in the fields ResultOf, ImportObjectFact, ImportPackageFact,
+			// ExportObjectFact, ExportPackageFact once modular facts and results are supported.
+		}
+		_, err := a.Run(pass)
+		if err != nil {
+			return err
 		}
 	}
+
+	return nil
 }

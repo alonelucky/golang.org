@@ -335,6 +335,8 @@ var goGitHubProjects = []string{
 	"golang/tools",
 	"golang/tour",
 	"golang/vgo",
+	"golang/website",
+	"golang/xerrors",
 }
 
 func setGoConfig() {

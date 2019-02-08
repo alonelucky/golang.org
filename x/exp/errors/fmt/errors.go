@@ -12,15 +12,19 @@ import (
 	"golang.org/x/exp/errors/internal"
 )
 
-// Errorf formats according to a format specifier and returns the string
-// as a value that satisfies error.
+// Errorf formats according to a format specifier and returns the string as a
+// value that satisfies error.
 //
-// The returned error includes the file and line number of the caller
-// when formatted with additional detail enabled.
+// The returned error includes the file and line number of the caller when
+// formatted with additional detail enabled. If the last argument is an error
+// the returned error's Format method will return it if the format string ends
+// with ": %s", ": %v", or ": %w". If the last argument is an error and the
+// format string ends with ": %w", the returned error implements errors.Wrapper
+// with an Unwrap method returning it.
 func Errorf(format string, a ...interface{}) error {
-	err := lastError(format, a)
+	err, wrap := lastError(format, a)
 	if err == nil {
-		return &simpleErr{Sprintf(format, a...), errors.Caller(1)}
+		return &noWrapError{Sprintf(format, a...), nil, errors.Caller(1)}
 	}
 
 	// TODO: this is not entirely correct. The error value could be
@@ -28,67 +32,70 @@ func Errorf(format string, a ...interface{}) error {
 	// substitutions. With relatively small changes to doPrintf we can
 	// have it optionally ignore extra arguments and pass the argument
 	// list in its entirety.
-	format = format[:len(format)-len(": %s")]
-	if !internal.EnableTrace {
-		return &withChain{msg: Sprintf(format, a[:len(a)-1]...), err: err}
+	msg := Sprintf(format[:len(format)-len(": %s")], a[:len(a)-1]...)
+	frame := errors.Frame{}
+	if internal.EnableTrace {
+		frame = errors.Caller(1)
 	}
-	return &withChain{
-		msg:   Sprintf(format, a[:len(a)-1]...),
-		err:   err,
-		frame: errors.Caller(1),
+	if wrap {
+		return &wrapError{msg, err, frame}
 	}
+	return &noWrapError{msg, err, frame}
 }
 
-func lastError(format string, a []interface{}) error {
-	if !strings.HasSuffix(format, ": %s") && !strings.HasSuffix(format, ": %v") {
-		return nil
+func lastError(format string, a []interface{}) (err error, wrap bool) {
+	wrap = strings.HasSuffix(format, ": %w")
+	if !wrap &&
+		!strings.HasSuffix(format, ": %s") &&
+		!strings.HasSuffix(format, ": %v") {
+		return nil, false
 	}
 
 	if len(a) == 0 {
-		return nil
+		return nil, false
 	}
 
 	err, ok := a[len(a)-1].(error)
 	if !ok {
-		return nil
+		return nil, false
 	}
 
-	return err
+	return err, wrap
 }
 
-type simpleErr struct {
-	msg   string
-	frame errors.Frame
-}
-
-func (e *simpleErr) Error() string {
-	return Sprint(e)
-}
-
-func (e *simpleErr) Format(p errors.Printer) (next error) {
-	p.Print(e.msg)
-	e.frame.Format(p)
-	return nil
-}
-
-type withChain struct {
-	// TODO: add frame information
+type noWrapError struct {
 	msg   string
 	err   error
 	frame errors.Frame
 }
 
-func (e *withChain) Error() string {
+func (e *noWrapError) Error() string {
 	return Sprint(e)
 }
 
-func (e *withChain) Format(p errors.Printer) (next error) {
+func (e *noWrapError) FormatError(p errors.Printer) (next error) {
 	p.Print(e.msg)
 	e.frame.Format(p)
 	return e.err
 }
 
-func (e *withChain) Unwrap() error {
+type wrapError struct {
+	msg   string
+	err   error
+	frame errors.Frame
+}
+
+func (e *wrapError) Error() string {
+	return Sprint(e)
+}
+
+func (e *wrapError) FormatError(p errors.Printer) (next error) {
+	p.Print(e.msg)
+	e.frame.Format(p)
+	return e.err
+}
+
+func (e *wrapError) Unwrap() error {
 	return e.err
 }
 
@@ -140,16 +147,8 @@ loop:
 		w.fmt.inDetail = false
 		switch v := err.(type) {
 		case errors.Formatter:
-			err = v.Format((*errPP)(w))
-		// TODO: This case is for supporting old error implementations.
-		// It may eventually disappear.
-		case interface{ FormatError(errors.Printer) error }:
 			err = v.FormatError((*errPP)(w))
 		case Formatter:
-			// Discard verb, but keep the flags. Discarding the verb prevents
-			// nested quoting and other unwanted behavior. Preserving flags
-			// recursively signals a request for detail, if interpreted as %+v.
-			w.fmt.fmtFlags = p.fmt.fmtFlags
 			if w.fmt.plusV {
 				v.Format((*errPPState)(w), 'v') // indent new lines
 			} else {
@@ -192,17 +191,27 @@ func (p *errPPState) Flag(c int) bool                { return (*pp)(p).Flag(c) }
 
 func (p *errPPState) Write(b []byte) (n int, err error) {
 	if !p.fmt.inDetail || p.fmt.plusV {
+		if len(b) == 0 {
+			return 0, nil
+		}
+		if p.fmt.inDetail && p.fmt.needNewline {
+			p.fmt.needNewline = false
+			p.buf.WriteByte(':')
+			p.buf.Write(detailSep)
+			if b[0] == '\n' {
+				b = b[1:]
+			}
+		}
 		k := 0
-		if p.fmt.indent {
-			for i, c := range b {
-				if c == '\n' {
-					p.buf.Write(b[k:i])
-					p.buf.Write(detailSep)
-					k = i + 1
-				}
+		for i, c := range b {
+			if c == '\n' {
+				p.buf.Write(b[k:i])
+				p.buf.Write(detailSep)
+				k = i + 1
 			}
 		}
 		p.buf.Write(b[k:])
+		p.fmt.needNewline = !p.fmt.inDetail
 	}
 	return len(b), nil
 }
@@ -212,7 +221,7 @@ type errPP pp
 
 func (p *errPP) Print(args ...interface{}) {
 	if !p.fmt.inDetail || p.fmt.plusV {
-		if p.fmt.indent {
+		if p.fmt.plusV {
 			Fprint((*errPPState)(p), args...)
 		} else {
 			(*pp)(p).doPrint(args)
@@ -222,7 +231,7 @@ func (p *errPP) Print(args ...interface{}) {
 
 func (p *errPP) Printf(format string, args ...interface{}) {
 	if !p.fmt.inDetail || p.fmt.plusV {
-		if p.fmt.indent {
+		if p.fmt.plusV {
 			Fprintf((*errPPState)(p), format, args...)
 		} else {
 			(*pp)(p).doPrintf(format, args)
@@ -231,11 +240,6 @@ func (p *errPP) Printf(format string, args ...interface{}) {
 }
 
 func (p *errPP) Detail() bool {
-	inDetail := p.fmt.inDetail
 	p.fmt.inDetail = true
-	p.fmt.indent = p.fmt.plusV
-	if p.fmt.plusV && !inDetail {
-		(*errPPState)(p).Write([]byte(":\n"))
-	}
 	return p.fmt.plusV
 }

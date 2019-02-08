@@ -882,7 +882,7 @@ func (b *gopherbot) closeStaleWaitingForInfo(ctx context.Context) error {
 
 }
 
-// cl2issue writes "Change https://golang.org/issue/NNNN mentions this issue"\
+// cl2issue writes "Change https://golang.org/cl/NNNN mentions this issue"
 // and the change summary on GitHub when a new Gerrit change references a GitHub issue.
 func (b *gopherbot) cl2issue(ctx context.Context) error {
 	monthAgo := time.Now().Add(-30 * 24 * time.Hour)
@@ -1360,13 +1360,13 @@ func (b *gopherbot) getMinorMilestoneForMajor(ctx context.Context, majorRel stri
 // closeCherryPickIssues closes cherry-pick issues when CLs are merged to
 // release branches, as GitHub only does that on merge to master.
 func (b *gopherbot) closeCherryPickIssues(ctx context.Context) error {
-	openCherryPickIssues := make(map[int32]*maintner.GitHubIssue) // by GitHub Issue Number
+	cherryPickIssues := make(map[int32]*maintner.GitHubIssue) // by GitHub Issue Number
 	b.gorepo.ForeachIssue(func(gi *maintner.GitHubIssue) error {
-		if gi.Closed || gi.PullRequest || gi.NotExist || gi.Milestone.IsNone() {
+		if gi.Closed || gi.PullRequest || gi.NotExist || gi.Milestone.IsNone() || gi.HasEvent("reopened") {
 			return nil
 		}
 		if strings.Count(gi.Milestone.Title, ".") == 2 { // minor release
-			openCherryPickIssues[gi.Number] = gi
+			cherryPickIssues[gi.Number] = gi
 		}
 		return nil
 	})
@@ -1388,7 +1388,7 @@ func (b *gopherbot) closeCherryPickIssues(ctx context.Context) error {
 				if id := ref.Repo.ID(); id.Owner != "golang" || id.Repo != "go" {
 					continue
 				}
-				gi, ok := openCherryPickIssues[ref.Number]
+				gi, ok := cherryPickIssues[ref.Number]
 				if !ok {
 					continue
 				}

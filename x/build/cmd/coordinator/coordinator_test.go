@@ -2,27 +2,64 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// +build linux
+
 package main
 
 import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/build/internal/buildgo"
+	"golang.org/x/build/maintner/maintnerd/apipb"
 )
+
+type Seconds float64
+
+func (s Seconds) Duration() time.Duration {
+	return time.Duration(float64(s) * float64(time.Second))
+}
+
+var fixedTestDuration = map[string]Seconds{
+	"go_test:a": 1,
+	"go_test:b": 1.5,
+	"go_test:c": 2,
+	"go_test:d": 2.50,
+	"go_test:e": 3,
+	"go_test:f": 3.5,
+	"go_test:g": 4,
+	"go_test:h": 4.5,
+	"go_test:i": 5,
+	"go_test:j": 5.5,
+	"go_test:k": 6.5,
+}
 
 func TestPartitionGoTests(t *testing.T) {
 	var in []string
 	for name := range fixedTestDuration {
 		in = append(in, name)
 	}
-	sets := partitionGoTests("", in)
-	for i, set := range sets {
-		t.Logf("set %d = \"-run=^(%s)$\"", i, strings.Join(set, "|"))
+	testDuration := func(builder, testName string) time.Duration {
+		if s, ok := fixedTestDuration[testName]; ok {
+			return s.Duration()
+		}
+		return 3 * time.Second
+	}
+	sets := partitionGoTests(testDuration, "", in)
+	want := [][]string{
+		{"go_test:a", "go_test:b", "go_test:c", "go_test:d", "go_test:e"},
+		{"go_test:f", "go_test:g"},
+		{"go_test:h", "go_test:i"},
+		{"go_test:j"},
+		{"go_test:k"},
+	}
+	if !reflect.DeepEqual(sets, want) {
+		t.Errorf(" got: %v\nwant: %v", sets, want)
 	}
 }
 
@@ -108,4 +145,27 @@ func TestTryStatusJSON(t *testing.T) {
 func TestStagingClusterBuilders(t *testing.T) {
 	// Just test that it doesn't panic:
 	stagingClusterBuilders()
+}
+
+// tests that we don't test Go 1.10 for the build repo
+func TestNewTrySetBuildRepoGo110(t *testing.T) {
+	testingKnobSkipBuilds = true
+
+	work := &apipb.GerritTryWorkItem{
+		Project:   "build",
+		Branch:    "master",
+		ChangeId:  "I6f05da2186b38dc8056081252563a82c50f0ce05",
+		Commit:    "a62e6a3ab11cc9cc2d9e22a50025dd33fc35d22f",
+		GoCommit:  []string{"a2e79571a9d3dbe3cf10dcaeb1f9c01732219869", "e39e43d7349555501080133bb426f1ead4b3ef97", "f5ff72d62301c4e9d0a78167fab5914ca12919bd"},
+		GoBranch:  []string{"master", "release-branch.go1.11", "release-branch.go1.10"},
+		GoVersion: []*apipb.MajorMinor{{1, 12}, {1, 11}, {1, 10}},
+	}
+	ts := newTrySet(work)
+	for i, bs := range ts.builds {
+		v := bs.NameAndBranch()
+		if strings.Contains(v, "Go 1.10.x") {
+			t.Errorf("unexpected builder: %v", v)
+		}
+		t.Logf("build[%d]: %s", i, v)
+	}
 }

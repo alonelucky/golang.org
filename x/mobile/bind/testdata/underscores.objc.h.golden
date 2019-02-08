@@ -7,6 +7,7 @@
 #define __Underscore_pkg_H__
 
 @import Foundation;
+#include "ref.h"
 #include "Universe.objc.h"
 
 
@@ -18,8 +19,7 @@
 
 - (instancetype)initWithRef:(id)ref;
 - (instancetype)init;
-- (NSString*)underscore_field;
-- (void)setUnderscore_field:(NSString*)v;
+@property (nonatomic) NSString* underscore_field;
 @end
 
 @interface Underscore_pkg : NSObject

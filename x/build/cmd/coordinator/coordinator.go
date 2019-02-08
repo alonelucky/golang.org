@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// +build linux
+
 // The coordinator runs the majority of the Go build system.
 //
 // It is responsible for finding build work and executing it,
@@ -17,7 +19,6 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -36,7 +37,6 @@ import (
 	"path"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +45,7 @@ import (
 	"go4.org/syncutil"
 	grpc "grpc.go4.org"
 
+	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/errorreporting"
 	"cloud.google.com/go/storage"
 	"golang.org/x/build"
@@ -55,6 +56,8 @@ import (
 	"golang.org/x/build/dashboard"
 	"golang.org/x/build/gerrit"
 	"golang.org/x/build/internal/buildgo"
+	"golang.org/x/build/internal/buildstats"
+	"golang.org/x/build/internal/singleflight"
 	"golang.org/x/build/internal/sourcecache"
 	"golang.org/x/build/livelog"
 	"golang.org/x/build/maintner/maintnerd/apipb"
@@ -983,9 +986,8 @@ func findTryWork() error {
 			log.Printf("Warning: skipping incomplete %#v", work)
 			continue
 		}
-		if work.Project == "build" || work.Project == "grpc-review" {
-			// Skip trybot request in build repo.
-			// Also skip grpc-review, which is only for reviews for now.
+		if work.Project == "grpc-review" {
+			// Skip grpc-review, which is only for reviews for now.
 			continue
 		}
 		key := tryWorkItemKey(work)
@@ -1071,6 +1073,8 @@ func tryWorkItemKey(work *apipb.GerritTryWorkItem) tryKey {
 	}
 }
 
+var testingKnobSkipBuilds bool
+
 // newTrySet creates a new trySet group of builders for a given
 // work item, the (Project, Branch, Change-ID, Commit) tuple.
 // It also starts goroutines for each build.
@@ -1092,12 +1096,27 @@ func newTrySet(work *apipb.GerritTryWorkItem) *trySet {
 	// is the Go revision to use to build & test the x/* repo
 	// with. The first element is the master branch. We test the
 	// master branch against all the normal builders configured to
-	// do subrepos (subTryBuilders above). Any GoCommit values past
-	// the first are for older release branches, but we use a limited
-	// subset of builders for those.
+	// do subrepos. Any GoCommit values past the first are for older
+	// release branches, but we use a limited subset of builders for those.
 	var goRev string
 	if len(work.GoCommit) > 0 {
 		goRev = work.GoCommit[0]
+	}
+
+	// Defensive check that the input is well-formed.
+	// Each GoCommit should have a GoBranch and a GoVersion.
+	// There should always be at least one GoVersion.
+	if len(work.GoBranch) < len(work.GoCommit) {
+		log.Printf("WARNING: len(GoBranch) of %d != len(GoCommit) of %d", len(work.GoBranch), len(work.GoCommit))
+		work.GoCommit = work.GoCommit[:len(work.GoBranch)]
+	}
+	if len(work.GoVersion) < len(work.GoCommit) {
+		log.Printf("WARNING: len(GoVersion) of %d != len(GoCommit) of %d", len(work.GoVersion), len(work.GoCommit))
+		work.GoCommit = work.GoCommit[:len(work.GoVersion)]
+	}
+	if len(work.GoVersion) == 0 {
+		log.Print("WARNING: len(GoVersion) is zero, want at least one")
+		work.GoVersion = []*apipb.MajorMinor{{}}
 	}
 
 	addBuilderToSet := func(bs *buildStatus, brev buildgo.BuilderRev) {
@@ -1107,12 +1126,21 @@ func newTrySet(work *apipb.GerritTryWorkItem) *trySet {
 		idx := len(ts.builds)
 		ts.builds = append(ts.builds, bs)
 		ts.remain++
+		if testingKnobSkipBuilds {
+			return
+		}
 		go bs.start() // acquires statusMu itself, so in a goroutine
 		go ts.awaitTryBuild(idx, bs, brev)
 	}
 
-	go ts.notifyStarting()
+	if !testingKnobSkipBuilds {
+		go ts.notifyStarting()
+	}
 	for _, bconf := range builders {
+		goVersion := types.MajorMinor{int(work.GoVersion[0].Major), int(work.GoVersion[0].Minor)}
+		if goVersion.Less(bconf.MinimumGoVersion) {
+			continue
+		}
 		brev := tryKeyToBuilderRev(bconf.Name, key, goRev)
 		bs, err := newBuild(brev)
 		if err != nil {
@@ -1122,12 +1150,9 @@ func newTrySet(work *apipb.GerritTryWorkItem) *trySet {
 		addBuilderToSet(bs, brev)
 	}
 
-	// Defensive check that the input is well-formed and each GoCommit
-	// has a GoBranch.
-	if len(work.GoBranch) < len(work.GoCommit) {
-		log.Printf("WARNING: len(GoBranch) of %d != len(GoCommit) of %d", len(work.GoBranch), len(work.GoCommit))
-		work.GoCommit = work.GoCommit[:len(work.GoBranch)]
-	}
+	// linuxBuilder is the standard builder we run for when testing x/* repos against
+	// the past two Go releases.
+	linuxBuilder := dashboard.Builders["linux-amd64"]
 
 	// If there's more than one GoCommit, that means this is an x/* repo
 	// and we're testing against previous releases of Go.
@@ -1137,7 +1162,14 @@ func newTrySet(work *apipb.GerritTryWorkItem) *trySet {
 			continue
 		}
 		branch := work.GoBranch[i]
-		brev := tryKeyToBuilderRev("linux-amd64", key, goRev)
+		if !linuxBuilder.BuildBranch(key.Project, "master", branch) {
+			continue
+		}
+		goVersion := types.MajorMinor{int(work.GoVersion[i].Major), int(work.GoVersion[i].Minor)}
+		if goVersion.Less(linuxBuilder.MinimumGoVersion) {
+			continue
+		}
+		brev := tryKeyToBuilderRev(linuxBuilder.Name, key, goRev)
 		bs, err := newBuild(brev)
 		if err != nil {
 			log.Printf("can't create build for %q: %v", brev, err)
@@ -1343,6 +1375,9 @@ func (ts *trySet) noteBuildComplete(bs *buildStatus) {
 	}
 }
 
+// skipBuild reports whether the br build should be skipped.
+//
+// TODO(bradfitz): move this policy func into dashboard/builders.go in its own CL sometime.
 func skipBuild(br buildgo.BuilderRev) bool {
 	if br.Name == "freebsd-arm-paulzhol" {
 		// This was a fragile little machine with limited memory.
@@ -1355,11 +1390,20 @@ func skipBuild(br buildgo.BuilderRev) bool {
 		return true
 	}
 	switch br.SubName {
-	case "build", // has external deps
-		"exp",    // always broken, depends on mobile which is broken
+	case "oauth2", "build":
+		// The oauth2 and build repos are our guinea pigs for
+		// testing using modules. But they currently only work
+		// inside the GCP network.
+		// TODO: once we proxy through the module proxy from
+		// reverse buildlets' localhost:3000 to
+		// authenticated+TLS farmer.golang.org to the GKE
+		// service, then we can use modules less
+		// conditionally.
+		bc, ok := dashboard.Builders[br.Name]
+		return !ok || bc.IsReverse()
+	case "exp", // always broken, depends on mobile which is broken
 		"mobile", // always broken (gl, etc). doesn't compile.
-		"term",   // no code yet in repo: "warning: "golang.org/x/term/..." matched no packages"
-		"oauth2": // has external deps
+		"term":   // no code yet in repo,
 		return true
 	case "perf":
 		if br.Name == "linux-amd64-nocgo" {
@@ -2219,10 +2263,11 @@ func (st *buildStatus) shouldSkipTest(testName string) bool {
 
 // newTestSet returns a new testSet given the dist test names (strings from "go tool dist test -list")
 // and benchmark items.
-func (st *buildStatus) newTestSet(distTestNames []string, benchmarks []*buildgo.BenchmarkItem) (*testSet, error) {
+func (st *buildStatus) newTestSet(testStats *buildstats.TestStats, distTestNames []string, benchmarks []*buildgo.BenchmarkItem) (*testSet, error) {
 	set := &testSet{
 		st:         st,
 		needsXRepo: map[string]string{},
+		testStats:  testStats,
 	}
 	for _, name := range distTestNames {
 		// The misc-vetall builder's "vet/*" tests are special: they require golang.org/x/tools
@@ -2240,7 +2285,7 @@ func (st *buildStatus) newTestSet(distTestNames []string, benchmarks []*buildgo.
 		set.items = append(set.items, &testItem{
 			set:      set,
 			name:     name,
-			duration: testDuration(st.BuilderRev.Name, name),
+			duration: testStats.Duration(st.BuilderRev.Name, name),
 			take:     make(chan token, 1),
 			done:     make(chan token),
 		})
@@ -2251,7 +2296,7 @@ func (st *buildStatus) newTestSet(distTestNames []string, benchmarks []*buildgo.
 			set:      set,
 			name:     name,
 			bench:    bench,
-			duration: testDuration(st.BuilderRev.Name, name),
+			duration: testStats.Duration(st.BuilderRev.Name, name),
 			take:     make(chan token, 1),
 			done:     make(chan token),
 		})
@@ -2259,7 +2304,7 @@ func (st *buildStatus) newTestSet(distTestNames []string, benchmarks []*buildgo.
 	return set, nil
 }
 
-func partitionGoTests(builderName string, tests []string) (sets [][]string) {
+func partitionGoTests(testDuration func(string, string) time.Duration, builderName string, tests []string) (sets [][]string) {
 	var srcTests []string
 	var cmdTests []string
 	for _, name := range tests {
@@ -2298,342 +2343,38 @@ func partitionGoTests(builderName string, tests []string) (sets [][]string) {
 	return
 }
 
-func secondsToDuration(sec float64) time.Duration {
-	return time.Duration(float64(sec) * float64(time.Second))
-}
-
-type testDurationMap map[string]map[string]time.Duration // builder name => test name => avg
-
 var (
-	testDurations   atomic.Value // of testDurationMap
-	testDurationsMu sync.Mutex   // held while updating testDurations
+	testStats       atomic.Value // of *buildstats.TestStats
+	testStatsLoader singleflight.Group
 )
 
-func getTestDurations() testDurationMap {
-	if m, ok := testDurations.Load().(testDurationMap); ok {
-		return m
+func getTestStats(sl spanlog.Logger) *buildstats.TestStats {
+	sp := sl.CreateSpan("get_test_stats")
+	ts, ok := testStats.Load().(*buildstats.TestStats)
+	if ok && ts.AsOf.After(time.Now().Add(-1*time.Hour)) {
+		sp.Done(nil)
+		return ts
 	}
-	testDurationsMu.Lock()
-	defer testDurationsMu.Unlock()
-	if m, ok := testDurations.Load().(testDurationMap); ok {
-		return m
-	}
-	updateTestDurationsLocked()
-	return testDurations.Load().(testDurationMap)
-}
-
-func updateTestDurations() {
-	testDurationsMu.Lock()
-	defer testDurationsMu.Unlock()
-	updateTestDurationsLocked()
-}
-
-func updateTestDurationsLocked() {
-	defer time.AfterFunc(1*time.Hour, updateTestDurations)
-	m := loadTestDurations()
-	testDurations.Store(m)
-}
-
-// The csv file on cloud storage looks like:
-//    Builder,Event,MedianSeconds,count
-//    linux-arm-arm5,run_test:runtime:cpu124,334.49922194,10
-//    linux-arm,run_test:runtime:cpu124,284.609130993,26
-//    linux-arm-arm5,run_test:go_test:cmd/compile/internal/gc,260.0241916,12
-//    linux-arm,run_test:go_test:cmd/compile/internal/gc,224.425924681,26
-//    solaris-amd64-smartosbuildlet,run_test:test:2_5,199.653975717,9
-//    solaris-amd64-smartosbuildlet,run_test:test:1_5,169.89733442,9
-//    solaris-amd64-smartosbuildlet,run_test:test:3_5,163.770453839,9
-//    solaris-amd64-smartosbuildlet,run_test:test:0_5,158.250119402,9
-//    openbsd-386-gce58,run_test:runtime:cpu124,146.494229388,12
-func loadTestDurations() (m testDurationMap) {
-	m = make(testDurationMap)
-	r, err := storageClient.Bucket(buildEnv.BuildletBucket).Object("test-durations.csv").NewReader(context.Background())
-	if err != nil {
-		log.Printf("loading test durations object from GCS: %v", err)
-		return
-	}
-	defer r.Close()
-	recs, err := csv.NewReader(r).ReadAll()
-	if err != nil {
-		log.Printf("reading test durations CSV: %v", err)
-		return
-	}
-	for _, rec := range recs {
-		if len(rec) < 3 || rec[0] == "Builder" {
-			continue
-		}
-		builder, testName, secondsStr := rec[0], rec[1], rec[2]
-		secs, err := strconv.ParseFloat(secondsStr, 64)
+	v, err, _ := testStatsLoader.Do("", func() (interface{}, error) {
+		log.Printf("getTestStats: reloading from BigQuery...")
+		sp := sl.CreateSpan("query_test_stats")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		ts, err := buildstats.QueryTestStats(ctx, buildEnv)
+		sp.Done(err)
 		if err != nil {
-			log.Printf("unexpected seconds value in test durations CSV: %v", err)
-			continue
+			log.Printf("getTestStats: error: %v", err)
+			return nil, err
 		}
-		mm := m[builder]
-		if mm == nil {
-			mm = make(map[string]time.Duration)
-			m[builder] = mm
-		}
-		mm[testName] = secondsToDuration(secs)
+		testStats.Store(ts)
+		return ts, nil
+	})
+	if err != nil {
+		sp.Done(err)
+		return nil
 	}
-	return
-}
-
-var minGoTestSpeed = (func() time.Duration {
-	var min Seconds
-	for name, secs := range fixedTestDuration {
-		if !strings.HasPrefix(name, "go_test:") {
-			continue
-		}
-		if min == 0 || secs < min {
-			min = secs
-		}
-	}
-	return min.Duration()
-})()
-
-type Seconds float64
-
-func (s Seconds) Duration() time.Duration {
-	return time.Duration(float64(s) * float64(time.Second))
-}
-
-// in seconds on Linux/amd64 (once on 2015-05-28), each
-// by themselves. There seems to be a 0.6s+ overhead
-// from the go tool which goes away if they're combined.
-var fixedTestDuration = map[string]Seconds{
-	"go_test:archive/tar":                    1.30,
-	"go_test:archive/zip":                    1.68,
-	"go_test:bufio":                          1.61,
-	"go_test:bytes":                          1.50,
-	"go_test:compress/bzip2":                 0.82,
-	"go_test:compress/flate":                 1.73,
-	"go_test:compress/gzip":                  0.82,
-	"go_test:compress/lzw":                   0.86,
-	"go_test:compress/zlib":                  1.78,
-	"go_test:container/heap":                 0.69,
-	"go_test:container/list":                 0.72,
-	"go_test:container/ring":                 0.64,
-	"go_test:crypto/aes":                     0.79,
-	"go_test:crypto/cipher":                  0.96,
-	"go_test:crypto/des":                     0.96,
-	"go_test:crypto/dsa":                     0.75,
-	"go_test:crypto/ecdsa":                   0.86,
-	"go_test:crypto/elliptic":                1.06,
-	"go_test:crypto/hmac":                    0.67,
-	"go_test:crypto/md5":                     0.77,
-	"go_test:crypto/rand":                    0.89,
-	"go_test:crypto/rc4":                     0.71,
-	"go_test:crypto/rsa":                     1.17,
-	"go_test:crypto/sha1":                    0.75,
-	"go_test:crypto/sha256":                  0.68,
-	"go_test:crypto/sha512":                  0.67,
-	"go_test:crypto/subtle":                  0.56,
-	"go_test:crypto/tls":                     3.29,
-	"go_test:crypto/x509":                    2.81,
-	"go_test:database/sql":                   1.75,
-	"go_test:database/sql/driver":            0.64,
-	"go_test:debug/dwarf":                    0.77,
-	"go_test:debug/elf":                      1.41,
-	"go_test:debug/gosym":                    1.45,
-	"go_test:debug/macho":                    0.97,
-	"go_test:debug/pe":                       0.79,
-	"go_test:debug/plan9obj":                 0.73,
-	"go_test:encoding/ascii85":               0.64,
-	"go_test:encoding/asn1":                  1.16,
-	"go_test:encoding/base32":                0.79,
-	"go_test:encoding/base64":                0.82,
-	"go_test:encoding/binary":                0.96,
-	"go_test:encoding/csv":                   0.67,
-	"go_test:encoding/gob":                   2.70,
-	"go_test:encoding/hex":                   0.66,
-	"go_test:encoding/json":                  2.20,
-	"test:errors":                            0.54,
-	"go_test:expvar":                         1.36,
-	"go_test:flag":                           0.92,
-	"go_test:fmt":                            2.02,
-	"go_test:go/ast":                         1.44,
-	"go_test:go/build":                       1.42,
-	"go_test:go/constant":                    0.92,
-	"go_test:go/doc":                         1.51,
-	"go_test:go/format":                      0.73,
-	"go_test:go/internal/gcimporter":         1.30,
-	"go_test:go/parser":                      1.30,
-	"go_test:go/printer":                     1.61,
-	"go_test:go/scanner":                     0.89,
-	"go_test:go/token":                       0.92,
-	"go_test:go/types":                       5.24,
-	"go_test:hash/adler32":                   0.62,
-	"go_test:hash/crc32":                     0.68,
-	"go_test:hash/crc64":                     0.55,
-	"go_test:hash/fnv":                       0.66,
-	"go_test:html":                           0.74,
-	"go_test:html/template":                  1.93,
-	"go_test:image":                          1.42,
-	"go_test:image/color":                    0.77,
-	"go_test:image/draw":                     1.32,
-	"go_test:image/gif":                      1.15,
-	"go_test:image/jpeg":                     1.32,
-	"go_test:image/png":                      1.23,
-	"go_test:index/suffixarray":              0.79,
-	"go_test:internal/singleflight":          0.66,
-	"go_test:io":                             0.97,
-	"go_test:io/ioutil":                      0.73,
-	"go_test:log":                            0.72,
-	"go_test:log/syslog":                     2.93,
-	"go_test:math":                           1.59,
-	"go_test:math/big":                       3.75,
-	"go_test:math/cmplx":                     0.81,
-	"go_test:math/rand":                      1.15,
-	"go_test:mime":                           1.01,
-	"go_test:mime/multipart":                 1.51,
-	"go_test:mime/quotedprintable":           0.95,
-	"go_test:net":                            6.71,
-	"go_test:net/http":                       9.41,
-	"go_test:net/http/cgi":                   2.00,
-	"go_test:net/http/cookiejar":             1.51,
-	"go_test:net/http/fcgi":                  1.43,
-	"go_test:net/http/httptest":              1.36,
-	"go_test:net/http/httputil":              1.54,
-	"go_test:net/http/internal":              0.68,
-	"go_test:net/internal/socktest":          0.58,
-	"go_test:net/mail":                       0.92,
-	"go_test:net/rpc":                        1.95,
-	"go_test:net/rpc/jsonrpc":                1.50,
-	"go_test:net/smtp":                       1.43,
-	"go_test:net/textproto":                  1.01,
-	"go_test:net/url":                        1.45,
-	"go_test:os":                             1.88,
-	"go_test:os/exec":                        2.13,
-	"go_test:os/signal":                      4.22,
-	"go_test:os/user":                        0.93,
-	"go_test:path":                           0.68,
-	"go_test:path/filepath":                  1.14,
-	"go_test:reflect":                        3.42,
-	"go_test:regexp":                         1.65,
-	"go_test:regexp/syntax":                  1.40,
-	"go_test:runtime":                        21.02,
-	"go_test:runtime/debug":                  0.79,
-	"go_test:runtime/pprof":                  8.01,
-	"go_test:sort":                           0.96,
-	"go_test:strconv":                        1.60,
-	"go_test:strings":                        1.51,
-	"go_test:sync":                           1.05,
-	"go_test:sync/atomic":                    1.13,
-	"go_test:syscall":                        1.69,
-	"go_test:testing":                        3.70,
-	"go_test:testing/quick":                  0.74,
-	"go_test:text/scanner":                   0.79,
-	"go_test:text/tabwriter":                 0.71,
-	"go_test:text/template":                  1.65,
-	"go_test:text/template/parse":            1.25,
-	"go_test:time":                           4.20,
-	"go_test:unicode":                        0.68,
-	"go_test:unicode/utf16":                  0.77,
-	"go_test:unicode/utf8":                   0.71,
-	"go_test:cmd/addr2line":                  1.73,
-	"go_test:cmd/api":                        1.33,
-	"go_test:cmd/asm/internal/asm":           1.24,
-	"go_test:cmd/asm/internal/lex":           0.91,
-	"go_test:cmd/compile/internal/big":       5.26,
-	"go_test:cmd/cover":                      3.32,
-	"go_test:cmd/fix":                        1.26,
-	"go_test:cmd/go":                         36,
-	"go_test:cmd/gofmt":                      1.06,
-	"go_test:cmd/internal/goobj":             0.65,
-	"go_test:cmd/internal/obj":               1.16,
-	"go_test:cmd/internal/obj/x86":           1.04,
-	"go_test:cmd/internal/rsc.io/arm/armasm": 1.92,
-	"go_test:cmd/internal/rsc.io/x86/x86asm": 2.22,
-	"go_test:cmd/newlink":                    1.48,
-	"go_test:cmd/nm":                         1.84,
-	"go_test:cmd/objdump":                    3.60,
-	"go_test:cmd/pack":                       2.64,
-	"go_test:cmd/pprof/internal/profile":     1.29,
-	"go_test:cmd/compile/internal/gc":        18,
-	"gp_test:cmd/compile/internal/ssa":       8,
-	"runtime:cpu124":                         44.78,
-	"sync_cpu":                               1.01,
-	"cgo_stdio":                              1.53,
-	"cgo_life":                               1.56,
-	"cgo_test":                               45.60,
-	"race":                                   42.55,
-	"testgodefs":                             2.37,
-	"testso":                                 2.72,
-	"testcarchive":                           11.11,
-	"testcshared":                            15.80,
-	"testshared":                             7.13,
-	"testasan":                               2.56,
-	"cgo_errors":                             7.03,
-	"testsigfwd":                             2.74,
-	"doc_progs":                              5.38,
-	"wiki":                                   3.56,
-	"shootout":                               11.34,
-	"bench_go1":                              3.72,
-	"test:0_5":                               10,
-	"test:1_5":                               10,
-	"test:2_5":                               10,
-	"test:3_5":                               10,
-	"test:4_5":                               10,
-	"codewalk":                               2.42,
-	"api":                                    7.38,
-
-	"go_test_bench:compress/bzip2":    3.059513602,
-	"go_test_bench:image/jpeg":        3.143345345,
-	"go_test_bench:encoding/hex":      3.182452293,
-	"go_test_bench:expvar":            3.490162906,
-	"go_test_bench:crypto/cipher":     3.609317114,
-	"go_test_bench:compress/lzw":      3.628982201,
-	"go_test_bench:database/sql":      3.693163398,
-	"go_test_bench:math/rand":         3.807438591,
-	"go_test_bench:bufio":             3.882166683,
-	"go_test_bench:context":           4.038173785,
-	"go_test_bench:hash/crc32":        4.107135055,
-	"go_test_bench:unicode/utf8":      4.205641826,
-	"go_test_bench:regexp/syntax":     4.587359311,
-	"go_test_bench:sort":              4.660599666,
-	"go_test_bench:math/cmplx":        5.311264213,
-	"go_test_bench:encoding/gob":      5.326788419,
-	"go_test_bench:reflect":           5.777081055,
-	"go_test_bench:image/png":         6.12439885,
-	"go_test_bench:html/template":     6.765132418,
-	"go_test_bench:fmt":               7.476528843,
-	"go_test_bench:sync":              7.526458261,
-	"go_test_bench:archive/zip":       7.782424696,
-	"go_test_bench:regexp":            8.428459563,
-	"go_test_bench:image/draw":        8.666510786,
-	"go_test_bench:strings":           10.836201759,
-	"go_test_bench:time":              10.952476479,
-	"go_test_bench:image/gif":         11.373276098,
-	"go_test_bench:encoding/json":     11.547950173,
-	"go_test_bench:crypto/tls":        11.548834754,
-	"go_test_bench:strconv":           12.819669296,
-	"go_test_bench:math":              13.7889302,
-	"go_test_bench:net":               14.845086695,
-	"go_test_bench:net/http":          15.288519219,
-	"go_test_bench:bytes":             15.809308703,
-	"go_test_bench:index/suffixarray": 23.69239388,
-	"go_test_bench:compress/flate":    26.906228664,
-	"go_test_bench:math/big":          28.82127674,
-}
-
-// testDuration predicts how long the dist test 'name' will take 'name' will take.
-// It's only a scheduling guess.
-func testDuration(builderName, testName string) time.Duration {
-	if false { // disabled for now. never tested. TODO: test, enable.
-		durs := getTestDurations()
-		bdur := durs[builderName]
-		if d, ok := bdur[testName]; ok {
-			return d
-		}
-	}
-	if secs, ok := fixedTestDuration[testName]; ok {
-		return secs.Duration()
-	}
-	if strings.HasPrefix(testName, "bench:") {
-		// Assume benchmarks are roughly 20 seconds per run.
-		return 2 * 5 * 20 * time.Second
-	}
-	return minGoTestSpeed * 2
+	sp.Done(nil)
+	return v.(*buildstats.TestStats)
 }
 
 func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
@@ -2689,10 +2430,11 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 		return nil, nil
 	}
 
-	// Recursively fetch the repo and its dependencies.
-	// Dependencies are always fetched at master, which isn't
-	// great but the dashboard data model doesn't track
-	// sub-repo dependencies. TODO(adg): fix this somehow??
+	// Recursively fetch the repo and their golang.org/x/*
+	// dependencies. Dependencies are always fetched at master,
+	// which isn't great but the dashboard data model doesn't
+	// track non-golang.org/x/* dependencies. For those, we
+	// require on the code under test to be using Go modules.
 	for i := 0; i < len(toFetch); i++ {
 		repo := toFetch[i]
 		if fetched[repo] {
@@ -2724,15 +2466,68 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 
 	sp := st.CreateSpan("running_subrepo_tests", st.SubName)
 	defer func() { sp.Done(err) }()
+
+	goProxy, err := st.moduleProxy()
+	if err != nil {
+		return nil, err
+	}
+	var go111Module, dir string
+	if goProxy != "" {
+		go111Module = "on"
+		dir = "gopath/src/golang.org/x/" + st.SubName
+	}
+
 	return st.bc.Exec(path.Join("go", "bin", "go"), buildlet.ExecOpts{
 		Output: st,
+		Dir:    dir,
 		ExtraEnv: append(st.conf.Env(),
 			"GOROOT="+goroot,
 			"GOPATH="+gopath,
+			"GO111MODULE="+go111Module,
+			"GOPROXY="+goProxy,
 		),
 		Path: []string{"$WORKDIR/go/bin", "$PATH"},
 		Args: []string{"test", "-short", subrepoPrefix + st.SubName + "/..."},
 	})
+}
+
+// moduleProxy returns the GOPROXY environment value to use for this
+// build's tests. If non-empty, GO111MODULE=on is included in the
+// environment as well. Returning two zero values means to not
+// configure the environment values.
+//
+// We go through a GCP-project-internal module proxy ("GOPROXY") to
+// eliminate load on the origin servers. Our builder VMs are ephemeral
+// and only run for the duration of one build. They also often don't
+// have all the VCS tools installed (or even available: there is no
+// git for plan9).
+func (bs *buildStatus) moduleProxy() (string, error) {
+	switch bs.SubName {
+	case "oauth2", "build":
+		// The two repos we're starting with for testing.
+	default:
+		return "", nil
+	}
+	// If we're running on localhost, just use the current environment's value.
+	if buildEnv == nil || !buildEnv.IsProd {
+		return os.Getenv("GOPROXY"), nil
+	}
+
+	// We run a NodePort service on each GKE node
+	// (cmd/coordinator/module-proxy-service.yaml) on port 30156
+	// that maps to the Athens service. We could round robin over
+	// all the GKE nodes' IPs if we wanted, but the coordinator is
+	// running on GKE so our node by definition is up, so just use it.
+	// It won't be much traffic.
+	// TODO: migrate to a GKE internal load balancer with an internal static IP
+	// once we migrate symbolic-datum-552 off a Legacy VPC network to the modern
+	// scheme that supports internal static IPs.
+	gkeNodeIP, err := metadata.Get("instance/network-interfaces/0/ip")
+	if err != nil || gkeNodeIP == "" {
+		log.Printf("WARNING: failed to discover local GCE node's IP: %v; disabling GOPROXY", err)
+		return "", nil
+	}
+	return "http://" + gkeNodeIP + ":30156", nil
 }
 
 // affectedPkgs returns the name of every package affected by this commit.
@@ -2788,7 +2583,10 @@ func (st *buildStatus) runTests(helpers <-chan *buildlet.Client) (remoteErr, err
 			benches = b
 		}
 	}
-	set, err := st.newTestSet(testNames, benches)
+
+	testStats := getTestStats(st)
+
+	set, err := st.newTestSet(testStats, testNames, benches)
 	if err != nil {
 		return nil, err
 	}
@@ -3142,8 +2940,9 @@ func (st *buildStatus) runTestsOnBuildlet(bc *buildlet.Client, tis []*testItem, 
 }
 
 type testSet struct {
-	st    *buildStatus
-	items []*testItem
+	st        *buildStatus
+	items     []*testItem
+	testStats *buildstats.TestStats
 
 	// needsXRepo is the set of x/$REPO repos needed in $GOPATH
 	// and which git rev that repo should be fetched at.
@@ -3212,7 +3011,7 @@ func (s *testSet) initInOrder() {
 
 	// First do the go_test:* ones. partitionGoTests
 	// only returns those, which are the ones we merge together.
-	stdSets := partitionGoTests(s.st.BuilderRev.Name, names)
+	stdSets := partitionGoTests(s.testStats.Duration, s.st.BuilderRev.Name, names)
 	for _, set := range stdSets {
 		tis := make([]*testItem, len(set))
 		for i, name := range set {

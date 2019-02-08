@@ -12,7 +12,7 @@ To install:
 	$ go get golang.org/x/mobile/cmd/gomobile
 	$ gomobile init
 
-At least Go 1.7 is required.
+At least Go 1.10 is required.
 For detailed instructions, see https://golang.org/wiki/Mobile.
 
 Usage:
@@ -103,8 +103,11 @@ installed.
 If the package directory contains an assets subdirectory, its contents
 are copied into the output.
 
-The -bundleid flag is for -target ios only and sets the bundle ID to use
-with the app; defaults to "org.golang.todo".
+Flag -iosversion sets the minimal version of the iOS SDK to compile against.
+The default version is 6.1.
+
+The -bundleid flag is required for -target ios and sets the bundle ID to use
+with the app.
 
 The -o flag specifies the output file name. If not specified, the
 output file name depends on the package built.

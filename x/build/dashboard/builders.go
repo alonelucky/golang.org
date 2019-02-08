@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"golang.org/x/build/buildenv"
+	"golang.org/x/build/types"
 )
 
 // Builders are the different build configurations.
@@ -147,7 +148,8 @@ var Hosts = map[string]*HostConfig{
 		SSHUsername:        "gopher",
 	},
 	"host-openbsd-amd64-64": &HostConfig{
-		VMImage:            "openbsd-amd64-64-v2",
+		VMImage:            "openbsd-amd64-64-190129a",
+		MinCPUPlatform:     "Intel Skylake", // for better TSC? Maybe? see Issue 29223. builds faster at least.
 		machineType:        "n1-highcpu-4",
 		buildletURLTmpl:    "https://storage.googleapis.com/$BUCKET/buildlet.openbsd-amd64-64",
 		goBootstrapURLTmpl: "https://storage.googleapis.com/$BUCKET/gobootstrap-openbsd-amd64-64.tar.gz",
@@ -204,8 +206,8 @@ var Hosts = map[string]*HostConfig{
 		SSHUsername:        "gopher",
 	},
 	"host-freebsd-12_0": &HostConfig{
-		VMImage:            "freebsd-amd64-120a8",
-		Notes:              "FreeBSD 12.0alpha8; GCE VM is built from script in build/env/freebsd-amd64",
+		VMImage:            "freebsd-amd64-120-v1",
+		Notes:              "FreeBSD 12.0; GCE VM is built from script in build/env/freebsd-amd64",
 		machineType:        "n1-highcpu-4",
 		buildletURLTmpl:    "https://storage.googleapis.com/$BUCKET/buildlet.freebsd-amd64",
 		goBootstrapURLTmpl: "https://storage.googleapis.com/$BUCKET/go1.4-freebsd-amd64.tar.gz",
@@ -256,7 +258,7 @@ var Hosts = map[string]*HostConfig{
 		OwnerGithub: "0intro",
 	},
 	"host-plan9-386-gce": &HostConfig{
-		VMImage:            "plan9-386-v6",
+		VMImage:            "plan9-386-v7",
 		Notes:              "Plan 9 from 0intro; GCE VM is built from script in build/env/plan9-386",
 		buildletURLTmpl:    "http://storage.googleapis.com/$BUCKET/buildlet.plan9-386",
 		goBootstrapURLTmpl: "https://storage.googleapis.com/$BUCKET/gobootstrap-plan9-386.tar.gz",
@@ -284,7 +286,7 @@ var Hosts = map[string]*HostConfig{
 		// only use 1, but we hope that 1 will be more powerful
 		// and we'll stop timing out on tests.
 		machineType: "n1-highcpu-4",
-		env:         []string{"GO_TEST_TIMEOUT_SCALE=2"},
+		env:         []string{"GO_TEST_TIMEOUT_SCALE=3"},
 	},
 	"host-windows-amd64-2008": &HostConfig{
 		VMImage:            "windows-amd64-server-2008r2-v7",
@@ -565,8 +567,9 @@ type HostConfig struct {
 	IsReverse      bool   // if true, only use the reverse buildlet pool
 
 	// GCE options, if VMImage != ""
-	machineType string // optional GCE instance type
-	RegularDisk bool   // if true, use spinning disk instead of SSD
+	machineType    string // optional GCE instance type
+	RegularDisk    bool   // if true, use spinning disk instead of SSD
+	MinCPUPlatform string // optional; https://cloud.google.com/compute/docs/instances/specify-min-cpu-platform
 
 	// ReverseOptions:
 	ExpectNum       int  // expected number of reverse buildlets of this type
@@ -615,6 +618,15 @@ type BuildConfig struct {
 	TryOnly     bool                   // only used for trybots, and not regular builds
 	CompileOnly bool                   // if true, compile tests, but don't run them
 	FlakyNet    bool                   // network tests are flaky (try anyway, but ignore some failures)
+
+	// MinimumGoVersion optionally specifies the minimum Go version
+	// this builder is allowed to use. It can be useful for skipping
+	// builders that are too new and no longer support some supported
+	// Go versions. It doesn't need to be set for builders that support
+	// all supported Go versions.
+	//
+	// Note: This field currently has effect on trybot runs only.
+	MinimumGoVersion types.MajorMinor
 
 	// MaxAtOnce optionally specifies a cap of how many builds of
 	// this type can run at once. Zero means unlimited. This is a
@@ -841,6 +853,15 @@ func (c *BuildConfig) BuildRepo(repo string) bool {
 // branch is the branch of the repo (usually "master").
 // goBranch is non-empty for a non-"go" repo, and is the branch of Go the subrepo is being tested at.
 func (c *BuildConfig) BuildBranch(repo, branch, goBranch string) bool {
+	// Don't try to build oauth2 or build before Go 1.11. These
+	// repos require modules.
+	switch repo {
+	case "oauth2", "build":
+		if branch == "release-branch.go1.10" || goBranch == "release-branch.go1.10" {
+			return false
+		}
+	}
+
 	if strings.HasPrefix(c.Name, "darwin-") {
 		switch c.Name {
 		case "darwin-amd64-10_8", "darwin-amd64-10_10", "darwin-amd64-10_11",
@@ -1023,8 +1044,9 @@ func defaultTrySet(extraProj ...string) func(proj string) bool {
 				return true
 			}
 		}
+		// TODO: remove items from this set once these repos have go.mod files:
 		switch proj {
-		case "grpc-review", "build", "exp", "mobile", "term", "oauth2":
+		case "grpc-review", "exp", "mobile", "term":
 			return false
 		}
 		return true
@@ -1082,6 +1104,7 @@ func init() {
 	addBuilder(BuildConfig{
 		Name:              "freebsd-amd64-12_0",
 		HostType:          "host-freebsd-12_0",
+		MinimumGoVersion:  types.MajorMinor{1, 11},
 		tryBot:            defaultTrySet(),
 		ShouldRunDistTest: fasterTrybots,
 		numTryTestHelpers: 4,
@@ -1423,6 +1446,7 @@ func init() {
 	addBuilder(BuildConfig{
 		Name:              "openbsd-amd64-64",
 		HostType:          "host-openbsd-amd64-64",
+		MinimumGoVersion:  types.MajorMinor{1, 11},
 		ShouldRunDistTest: noTestDir,
 		tryBot:            defaultTrySet(),
 		numTestHelpers:    0,
@@ -1458,6 +1482,14 @@ func init() {
 		HostType:       "host-plan9-386-gce",
 		numTestHelpers: 1,
 		MaxAtOnce:      2,
+		ShouldRunDistTest: func(distTestName string, isTry bool) bool {
+			switch distTestName {
+			case "api",
+				"go_test:cmd/go": // takes over 20 minutes without working SMP
+				return false
+			}
+			return true
+		},
 	})
 	addBuilder(BuildConfig{
 		Name:              "windows-amd64-2008",
@@ -1527,8 +1559,9 @@ func init() {
 			"GO_TEST_TIMEOUT_SCALE=2"},
 	})
 	addBuilder(BuildConfig{
-		Name:     "windows-arm",
-		HostType: "host-windows-arm-iotcore",
+		Name:         "windows-arm",
+		HostType:     "host-windows-arm-iotcore",
+		SkipSnapshot: true,
 		env: []string{
 			"GOARM=7",
 			"GO_TEST_TIMEOUT_SCALE=2",
@@ -1752,6 +1785,9 @@ func init() {
 	addBuilder(BuildConfig{
 		Name:     "aix-ppc64",
 		HostType: "host-aix-ppc64-osuosl",
+		env: []string{
+			"PATH=/opt/freeware/bin:/usr/bin:/etc:/usr/sbin:/usr/ucb:/usr/bin/X11:/sbin:/usr/java7_64/jre/bin:/usr/java7_64/bin",
+		},
 	})
 
 }
