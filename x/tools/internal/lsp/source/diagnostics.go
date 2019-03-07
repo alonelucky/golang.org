@@ -13,29 +13,55 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/asmdecl"
+	"golang.org/x/tools/go/analysis/passes/assign"
+	"golang.org/x/tools/go/analysis/passes/atomic"
+	"golang.org/x/tools/go/analysis/passes/atomicalign"
+	"golang.org/x/tools/go/analysis/passes/bools"
+	"golang.org/x/tools/go/analysis/passes/buildtag"
+	"golang.org/x/tools/go/analysis/passes/cgocall"
+	"golang.org/x/tools/go/analysis/passes/composite"
+	"golang.org/x/tools/go/analysis/passes/copylock"
+	"golang.org/x/tools/go/analysis/passes/httpresponse"
+	"golang.org/x/tools/go/analysis/passes/loopclosure"
+	"golang.org/x/tools/go/analysis/passes/lostcancel"
+	"golang.org/x/tools/go/analysis/passes/nilfunc"
+	"golang.org/x/tools/go/analysis/passes/printf"
+	"golang.org/x/tools/go/analysis/passes/shift"
+	"golang.org/x/tools/go/analysis/passes/stdmethods"
+	"golang.org/x/tools/go/analysis/passes/structtag"
 	"golang.org/x/tools/go/analysis/passes/tests"
+	"golang.org/x/tools/go/analysis/passes/unmarshal"
+	"golang.org/x/tools/go/analysis/passes/unreachable"
+	"golang.org/x/tools/go/analysis/passes/unsafeptr"
+	"golang.org/x/tools/go/analysis/passes/unusedresult"
 
 	"golang.org/x/tools/go/packages"
 )
 
 type Diagnostic struct {
 	Range
-	Message string
-	Source  string
+	Message  string
+	Source   string
+	Severity DiagnosticSeverity
 }
+
+type DiagnosticSeverity int
+
+const (
+	SeverityWarning DiagnosticSeverity = iota
+	SeverityError
+)
 
 func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic, error) {
 	f, err := v.GetFile(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
-	pkg, err := f.GetPackage()
-	if err != nil {
-		return nil, err
-	}
+	pkg := f.GetPackage()
 	// Prepare the reports we will send for this package.
 	reports := make(map[string][]Diagnostic)
-	for _, filename := range pkg.GoFiles {
+	for _, filename := range pkg.CompiledGoFiles {
 		reports[filename] = []Diagnostic{}
 	}
 	var parseErrors, typeErrors []packages.Error
@@ -61,15 +87,8 @@ func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic,
 		if err != nil {
 			continue
 		}
-		diagTok, err := diagFile.GetToken()
-		if err != nil {
-			continue
-		}
-		content, err := diagFile.Read()
-		if err != nil {
-			continue
-		}
-		end, err := identifierEnd(content, pos.Line, pos.Column)
+		diagTok := diagFile.GetToken()
+		end, err := identifierEnd(diagFile.GetContent(), pos.Line, pos.Column)
 		// Don't set a range if it's anything other than a type error.
 		if err != nil || diag.Kind != packages.TypeError {
 			end = 0
@@ -87,7 +106,8 @@ func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic,
 				Start: startPos,
 				End:   endPos,
 			},
-			Message: diag.Msg,
+			Message:  diag.Msg,
+			Severity: SeverityError,
 		}
 		if _, ok := reports[pos.Filename]; ok {
 			reports[pos.Filename] = append(reports[pos.Filename], diagnostic)
@@ -97,7 +117,7 @@ func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic,
 		return reports, nil
 	}
 	// Type checking and parsing succeeded. Run analyses.
-	runAnalyses(pkg, func(a *analysis.Analyzer, diag analysis.Diagnostic) {
+	runAnalyses(v.GetAnalysisCache(), pkg, func(a *analysis.Analyzer, diag analysis.Diagnostic) {
 		pos := pkg.Fset.Position(diag.Pos)
 		category := a.Name
 		if diag.Category != "" {
@@ -105,9 +125,10 @@ func Diagnostics(ctx context.Context, v View, uri URI) (map[string][]Diagnostic,
 		}
 
 		reports[pos.Filename] = append(reports[pos.Filename], Diagnostic{
-			Source:  category,
-			Range:   Range{Start: diag.Pos, End: diag.Pos},
-			Message: fmt.Sprintf(diag.Message),
+			Source:   category,
+			Range:    Range{Start: diag.Pos, End: diag.Pos},
+			Message:  fmt.Sprintf(diag.Message),
+			Severity: SeverityWarning,
 		})
 	})
 
@@ -165,35 +186,44 @@ func identifierEnd(content []byte, l, c int) (int, error) {
 	return bytes.IndexAny(line[c-1:], " \n,():;[]"), nil
 }
 
-func runAnalyses(pkg *packages.Package, report func(a *analysis.Analyzer, diag analysis.Diagnostic)) error {
+func runAnalyses(c *AnalysisCache, pkg *packages.Package, report func(a *analysis.Analyzer, diag analysis.Diagnostic)) error {
+	// the traditional vet suite:
 	analyzers := []*analysis.Analyzer{
-		tests.Analyzer, // an analyzer that doesn't have facts or requires
+		asmdecl.Analyzer,
+		assign.Analyzer,
+		atomic.Analyzer,
+		atomicalign.Analyzer,
+		bools.Analyzer,
+		buildtag.Analyzer,
+		cgocall.Analyzer,
+		composite.Analyzer,
+		copylock.Analyzer,
+		httpresponse.Analyzer,
+		loopclosure.Analyzer,
+		lostcancel.Analyzer,
+		nilfunc.Analyzer,
+		printf.Analyzer,
+		shift.Analyzer,
+		stdmethods.Analyzer,
+		structtag.Analyzer,
+		tests.Analyzer,
+		unmarshal.Analyzer,
+		unreachable.Analyzer,
+		unsafeptr.Analyzer,
+		unusedresult.Analyzer,
 	}
-	for _, a := range analyzers {
-		if len(a.FactTypes) > 0 {
-			panic("for analyzer " + a.Name + " modular analyses needing facts are not yet supported")
-		}
-		if len(a.Requires) > 0 {
-			panic("for analyzer " + a.Name + " analyses requiring results are not yet supported")
-		}
-		pass := &analysis.Pass{
-			Analyzer: a,
 
-			Fset:       pkg.Fset,
-			Files:      pkg.Syntax,
-			OtherFiles: pkg.OtherFiles,
-			Pkg:        pkg.Types,
-			TypesInfo:  pkg.TypesInfo,
-			TypesSizes: pkg.TypesSizes,
+	roots := c.analyze([]*packages.Package{pkg}, analyzers)
 
-			Report: func(diagnostic analysis.Diagnostic) { report(a, diagnostic) },
-
-			// TODO(matloob): Fill in the fields ResultOf, ImportObjectFact, ImportPackageFact,
-			// ExportObjectFact, ExportPackageFact once modular facts and results are supported.
-		}
-		_, err := a.Run(pass)
-		if err != nil {
-			return err
+	// Report diagnostics and errors from root analyzers.
+	for _, r := range roots {
+		for _, diag := range r.diagnostics {
+			if r.err != nil {
+				// TODO(matloob): This isn't quite right: we might return a failed prerequisites error,
+				// which isn't super useful...
+				return r.err
+			}
+			report(r.a, diag)
 		}
 	}
 

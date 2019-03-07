@@ -6,7 +6,6 @@ package main
 
 import (
 	"archive/zip"
-	"errors"
 	"fmt"
 	"go/build"
 	"io"
@@ -21,10 +20,6 @@ import (
 func goAndroidBind(gobind string, pkgs []*build.Package, androidArchs []string) error {
 	if sdkDir := os.Getenv("ANDROID_HOME"); sdkDir == "" {
 		return fmt.Errorf("this command requires ANDROID_HOME environment variable (path to the Android SDK)")
-	}
-
-	if !hasNDK() {
-		return errors.New("no Android NDK path is set. Please run gomobile init with the ndk-bundle installed through the Android SDK manager or with the -ndk flag set.")
 	}
 
 	// Run gobind to generate the bindings
@@ -160,6 +155,13 @@ func buildAAR(srcDir, androidDir string, pkgs []*build.Package, androidArchs []s
 		return err
 	}
 	fmt.Fprintln(w, `-keep class go.** { *; }`)
+	if bindJavaPkg != "" {
+		fmt.Fprintln(w, `-keep class `+bindJavaPkg+`.** { *; }`)
+	} else {
+		for _, p := range pkgs {
+			fmt.Fprintln(w, `-keep class `+p.Name+`.** { *; }`)
+		}
+	}
 
 	w, err = aarwcreate("classes.jar")
 	if err != nil {

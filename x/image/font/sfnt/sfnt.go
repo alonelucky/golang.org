@@ -77,6 +77,7 @@ var (
 	errInvalidDfont           = errors.New("sfnt: invalid dfont")
 	errInvalidFont            = errors.New("sfnt: invalid font")
 	errInvalidFontCollection  = errors.New("sfnt: invalid font collection")
+	errInvalidGPOSTable       = errors.New("sfnt: invalid GPOS table")
 	errInvalidGlyphData       = errors.New("sfnt: invalid glyph data")
 	errInvalidGlyphDataLength = errors.New("sfnt: invalid glyph data length")
 	errInvalidHeadTable       = errors.New("sfnt: invalid head table")
@@ -97,11 +98,14 @@ var (
 
 	errUnsupportedCFFFDSelectTable     = errors.New("sfnt: unsupported CFF FDSelect table")
 	errUnsupportedCFFVersion           = errors.New("sfnt: unsupported CFF version")
+	errUnsupportedClassDefFormat       = errors.New("sfnt: unsupported class definition format")
 	errUnsupportedCmapEncodings        = errors.New("sfnt: unsupported cmap encodings")
 	errUnsupportedCompoundGlyph        = errors.New("sfnt: unsupported compound glyph")
+	errUnsupportedCoverageFormat       = errors.New("sfnt: unsupported coverage format")
+	errUnsupportedExtensionPosFormat   = errors.New("sfnt: unsupported extension positioning format")
+	errUnsupportedGPOSTable            = errors.New("sfnt: unsupported GPOS table")
 	errUnsupportedGlyphDataLength      = errors.New("sfnt: unsupported glyph data length")
 	errUnsupportedKernTable            = errors.New("sfnt: unsupported kern table")
-	errUnsupportedRealNumberEncoding   = errors.New("sfnt: unsupported real number encoding")
 	errUnsupportedNumberOfCmapSegments = errors.New("sfnt: unsupported number of cmap segments")
 	errUnsupportedNumberOfFontDicts    = errors.New("sfnt: unsupported number of font dicts")
 	errUnsupportedNumberOfFonts        = errors.New("sfnt: unsupported number of fonts")
@@ -110,6 +114,7 @@ var (
 	errUnsupportedNumberOfTables       = errors.New("sfnt: unsupported number of tables")
 	errUnsupportedPlatformEncoding     = errors.New("sfnt: unsupported platform encoding")
 	errUnsupportedPostTable            = errors.New("sfnt: unsupported post table")
+	errUnsupportedRealNumberEncoding   = errors.New("sfnt: unsupported real number encoding")
 	errUnsupportedTableOffsetLength    = errors.New("sfnt: unsupported table offset or length")
 	errUnsupportedType2Charstring      = errors.New("sfnt: unsupported Type 2 Charstring")
 )
@@ -242,6 +247,33 @@ func (s *source) view(buf []byte, offset, length int) ([]byte, error) {
 		return nil, err
 	}
 	return buf, nil
+}
+
+// varLenView returns bytes from the given offset for sub-tables with varying
+// length. The length of bytes is determined by staticLength plus n*itemLength,
+// where n is read as uint16 from countOffset (relative to offset). buf is an
+// optional scratch buffer (see source.view())
+func (s *source) varLenView(buf []byte, offset, staticLength, countOffset, itemLength int) ([]byte, int, error) {
+	if 0 > offset || offset > offset+staticLength {
+		return nil, 0, errInvalidBounds
+	}
+	if 0 > countOffset || countOffset+1 >= staticLength {
+		return nil, 0, errInvalidBounds
+	}
+
+	// read static part which contains our count
+	buf, err := s.view(buf, offset, staticLength)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	count := int(u16(buf[countOffset:]))
+	buf, err = s.view(buf, offset, staticLength+count*itemLength)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return buf, count, nil
 }
 
 // u16 returns the uint16 in the table t at the relative offset i.
@@ -557,7 +589,8 @@ type Font struct {
 	// https://www.microsoft.com/typography/otspec/otff.htm#otttables
 	// "Advanced Typographic Tables".
 	//
-	// TODO: base, gdef, gpos, gsub, jstf, math?
+	// TODO: base, gdef, gsub, jstf, math?
+	gpos table
 
 	// https://www.microsoft.com/typography/otspec/otff.htm#otttables
 	// "Other OpenType Tables".
@@ -577,6 +610,7 @@ type Font struct {
 		isPostScript     bool
 		kernNumPairs     int32
 		kernOffset       int32
+		kernFuncs        []kernFunc
 		lineGap          int32
 		numHMetrics      int32
 		post             *PostTable
@@ -629,6 +663,10 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	if err != nil {
 		return err
 	}
+	buf, kernFuncs, err := f.parseGPOSKern(buf)
+	if err != nil {
+		return err
+	}
 	buf, ascent, descent, lineGap, run, rise, numHMetrics, err := f.parseHhea(buf, numGlyphs)
 	if err != nil {
 		return err
@@ -657,6 +695,7 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	f.cached.isPostScript = isPostScript
 	f.cached.kernNumPairs = kernNumPairs
 	f.cached.kernOffset = kernOffset
+	f.cached.kernFuncs = kernFuncs
 	f.cached.lineGap = lineGap
 	f.cached.numHMetrics = numHMetrics
 	f.cached.post = post
@@ -751,6 +790,8 @@ func (f *Font) initializeTables(offset int, isDfont bool) (buf1 []byte, isPostSc
 			f.cmap = table{o, n}
 		case 0x676c7966:
 			f.glyf = table{o, n}
+		case 0x47504f53:
+			f.gpos = table{o, n}
 		case 0x68656164:
 			f.head = table{o, n}
 		case 0x68686561:
@@ -972,8 +1013,8 @@ func (f *Font) parseKernVersion0(buf []byte, offset, length int) (buf1 []byte, k
 	if version := u16(buf); version != 0 {
 		return nil, 0, 0, errUnsupportedKernTable
 	}
-	subtableLength := int(u16(buf[2:]))
-	if subtableLength < headerSize || length < subtableLength {
+	subtableLengthU16 := u16(buf[2:])
+	if int(subtableLengthU16) < headerSize || length < int(subtableLengthU16) {
 		return nil, 0, 0, errInvalidKernTable
 	}
 	if coverageBits := buf[5]; coverageBits != 0x01 {
@@ -982,11 +1023,11 @@ func (f *Font) parseKernVersion0(buf []byte, offset, length int) (buf1 []byte, k
 	}
 	offset += headerSize
 	length -= headerSize
-	subtableLength -= headerSize
+	subtableLengthU16 -= headerSize
 
 	switch format := buf[4]; format {
 	case 0:
-		return f.parseKernFormat0(buf, offset, subtableLength)
+		return f.parseKernFormat0(buf, offset, length, subtableLengthU16)
 	case 2:
 		// If we could find such a font, we could write code to support it, but
 		// a comment in the equivalent FreeType code (sfnt/ttkern.c) says that
@@ -995,7 +1036,7 @@ func (f *Font) parseKernVersion0(buf []byte, offset, length int) (buf1 []byte, k
 	return nil, 0, 0, errUnsupportedKernTable
 }
 
-func (f *Font) parseKernFormat0(buf []byte, offset, length int) (buf1 []byte, kernNumPairs, kernOffset int32, err error) {
+func (f *Font) parseKernFormat0(buf []byte, offset, length int, subtableLengthU16 uint16) (buf1 []byte, kernNumPairs, kernOffset int32, err error) {
 	const headerSize, entrySize = 8, 6
 	if length < headerSize {
 		return nil, 0, 0, errInvalidKernTable
@@ -1005,7 +1046,13 @@ func (f *Font) parseKernFormat0(buf []byte, offset, length int) (buf1 []byte, ke
 		return nil, 0, 0, err
 	}
 	kernNumPairs = int32(u16(buf))
-	if length != headerSize+entrySize*int(kernNumPairs) {
+
+	// The subtable length from the kern table is only uint16. Fonts like
+	// Cambria, Calibri or Corbel have more then 10k kerning pairs and the
+	// actual subtable size is truncated to uint16. Compare size with KERN
+	// length and truncated size with subtable length.
+	n := headerSize + entrySize*int(kernNumPairs)
+	if (length < n) || (subtableLengthU16 != uint16(n)) {
 		return nil, 0, 0, errInvalidKernTable
 	}
 	return buf, kernNumPairs, int32(offset) + headerSize, nil
@@ -1488,10 +1535,32 @@ func (f *Font) GlyphAdvance(b *Buffer, x GlyphIndex, ppem fixed.Int26_6, h font.
 //
 // It returns ErrNotFound if either glyph index is out of range.
 func (f *Font) Kern(b *Buffer, x0, x1 GlyphIndex, ppem fixed.Int26_6, h font.Hinting) (fixed.Int26_6, error) {
-	// TODO: how should this work with the GPOS table and CFF fonts?
-	// https://www.microsoft.com/typography/otspec/kern.htm says that
-	// "OpenType™ fonts containing CFF outlines are not supported by the 'kern'
-	// table and must use the 'GPOS' OpenType Layout table."
+
+	// Use GPOS kern tables if available.
+	if f.cached.kernFuncs != nil {
+		for _, kf := range f.cached.kernFuncs {
+			adv, err := kf(x0, x1)
+			if err == ErrNotFound {
+				continue
+			}
+			if err != nil {
+				return 0, err
+			}
+			kern := fixed.Int26_6(adv)
+			kern = scale(kern*ppem, f.cached.unitsPerEm)
+			if h == font.HintingFull {
+				// Quantize the fixed.Int26_6 value to the nearest pixel.
+				kern = (kern + 32) &^ 63
+			}
+			return kern, nil
+		}
+		return 0, ErrNotFound
+	}
+
+	// Fallback to kern table.
+
+	// TODO: Convert kern table handling into kernFunc and decide in Parse if
+	// GPOS or kern should be used.
 
 	if n := f.NumGlyphs(); int(x0) >= n || int(x1) >= n {
 		return 0, ErrNotFound

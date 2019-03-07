@@ -8,13 +8,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
 	"go/token"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/packages/packagestest"
 	"golang.org/x/tools/internal/lsp/cache"
 	"golang.org/x/tools/internal/lsp/diff"
@@ -36,8 +37,8 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 	// We hardcode the expected number of test cases to ensure that all tests
 	// are being executed. If a test is added, this number must be changed.
 	const expectedCompletionsCount = 63
-	const expectedDiagnosticsCount = 15
-	const expectedFormatCount = 3
+	const expectedDiagnosticsCount = 16
+	const expectedFormatCount = 4
 	const expectedDefinitionsCount = 16
 	const expectedTypeDefinitionsCount = 2
 
@@ -60,7 +61,10 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 	// Merge the exported.Config with the view.Config.
 	cfg := *exported.Config
 	cfg.Fset = token.NewFileSet()
-	cfg.Mode = packages.LoadSyntax
+	cfg.Context = context.Background()
+	cfg.ParseFile = func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
+		return parser.ParseFile(fset, filename, src, parser.AllErrors|parser.ParseComments)
+	}
 
 	s := &server{
 		view: cache.NewView(&cfg),
@@ -178,9 +182,13 @@ func (d diagnostics) collect(fset *token.FileSet, rng packagestest.Range, msgSou
 	if msg == "" {
 		return
 	}
+	severity := protocol.SeverityError
+	if strings.Contains(f.Name(), "analyzer") {
+		severity = protocol.SeverityWarning
+	}
 	want := protocol.Diagnostic{
 		Range:    toProtocolRange(f, source.Range(rng)),
-		Severity: protocol.SeverityError,
+		Severity: severity,
 		Source:   msgSource,
 		Message:  msg,
 	}
@@ -206,7 +214,7 @@ func diffDiagnostics(filename string, want, got []protocol.Diagnostic) string {
 			if g.Range.Start != g.Range.End || w.Range.Start != g.Range.End {
 				goto Failed
 			}
-		} else {
+		} else if g.Range.End != g.Range.Start { // Accept any 'want' range if the diagnostic returns a zero-length range.
 			if w.Range.End != g.Range.End {
 				goto Failed
 			}
@@ -370,31 +378,32 @@ func (f formats) test(t *testing.T, s *server) {
 		if err != nil {
 			t.Error(err)
 		}
-		original, err := f.Read()
-		if err != nil {
-			t.Error(err)
-		}
 		var ops []*diff.Op
 		for _, edit := range edits {
+			start := int(edit.Range.Start.Line)
+			end := int(edit.Range.End.Line)
+			if start == end && edit.Range.End.Character > 1 {
+				end++
+			}
 			if edit.NewText == "" { // deletion
 				ops = append(ops, &diff.Op{
 					Kind: diff.Delete,
-					I1:   int(edit.Range.Start.Line),
-					I2:   int(edit.Range.End.Line),
+					I1:   start,
+					I2:   end,
 				})
 			} else if edit.Range.Start == edit.Range.End { // insertion
 				ops = append(ops, &diff.Op{
 					Kind:    diff.Insert,
 					Content: edit.NewText,
-					I1:      int(edit.Range.Start.Line),
-					I2:      int(edit.Range.End.Line),
+					I1:      start,
+					I2:      end,
 				})
 			}
 		}
-		split := strings.SplitAfter(string(original), "\n")
+		split := strings.SplitAfter(string(f.GetContent()), "\n")
 		got := strings.Join(diff.ApplyEdits(split, ops), "")
 		if gofmted != got {
-			t.Errorf("format failed for %s: expected %v, got %v", filename, gofmted, got)
+			t.Errorf("format failed for %s: expected '%v', got '%v'", filename, gofmted, got)
 		}
 	}
 }
@@ -437,4 +446,32 @@ func (d definitions) test(t *testing.T, s *server, typ bool) {
 func (d definitions) collect(fset *token.FileSet, src, target packagestest.Range) {
 	loc := toProtocolLocation(fset, source.Range(src))
 	d[loc] = toProtocolLocation(fset, source.Range(target))
+}
+
+func TestBytesOffset(t *testing.T) {
+	tests := []struct {
+		text string
+		pos  protocol.Position
+		want int
+	}{
+		{text: `a𐐀b`, pos: protocol.Position{Line: 0, Character: 0}, want: 0},
+		{text: `a𐐀b`, pos: protocol.Position{Line: 0, Character: 1}, want: 1},
+		{text: `a𐐀b`, pos: protocol.Position{Line: 0, Character: 2}, want: 1},
+		{text: `a𐐀b`, pos: protocol.Position{Line: 0, Character: 3}, want: 5},
+		{text: `a𐐀b`, pos: protocol.Position{Line: 0, Character: 4}, want: -1},
+		{text: "aaa\nbbb\n", pos: protocol.Position{Line: 0, Character: 3}, want: 3},
+		{text: "aaa\nbbb\n", pos: protocol.Position{Line: 0, Character: 4}, want: -1},
+		{text: "aaa\nbbb\n", pos: protocol.Position{Line: 1, Character: 0}, want: 4},
+		{text: "aaa\nbbb\n", pos: protocol.Position{Line: 1, Character: 3}, want: 7},
+		{text: "aaa\nbbb\n", pos: protocol.Position{Line: 1, Character: 4}, want: -1},
+		{text: "aaa\nbbb\n", pos: protocol.Position{Line: 2, Character: 0}, want: -1},
+		{text: "aaa\nbbb\n\n", pos: protocol.Position{Line: 2, Character: 0}, want: 8},
+	}
+
+	for _, test := range tests {
+		got := bytesOffset([]byte(test.text), test.pos)
+		if got != test.want {
+			t.Errorf("want %d for %q(Line:%d,Character:%d), but got %d", test.want, test.text, int(test.pos.Line), int(test.pos.Character), got)
+		}
+	}
 }

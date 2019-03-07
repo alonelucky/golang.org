@@ -5,7 +5,6 @@
 package source
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"go/ast"
@@ -51,14 +50,8 @@ func Identifier(ctx context.Context, v View, f File, pos token.Pos) (*Identifier
 
 func (i *IdentifierInfo) Hover(q types.Qualifier) (string, error) {
 	if q == nil {
-		fAST, err := i.File.GetAST()
-		if err != nil {
-			return "", err
-		}
-		pkg, err := i.File.GetPackage()
-		if err != nil {
-			return "", err
-		}
+		fAST := i.File.GetAST()
+		pkg := i.File.GetPackage()
 		q = qualifier(fAST, pkg.Types, pkg.TypesInfo)
 	}
 	return types.ObjectString(i.Declaration.Object, q), nil
@@ -66,14 +59,8 @@ func (i *IdentifierInfo) Hover(q types.Qualifier) (string, error) {
 
 // identifier checks a single position for a potential identifier.
 func identifier(ctx context.Context, v View, f File, pos token.Pos) (*IdentifierInfo, error) {
-	fAST, err := f.GetAST()
-	if err != nil {
-		return nil, err
-	}
-	pkg, err := f.GetPackage()
-	if err != nil {
-		return nil, err
-	}
+	fAST := f.GetAST()
+	pkg := f.GetPackage()
 	path, _ := astutil.PathEnclosingInterval(fAST, pos, pos)
 	result := &IdentifierInfo{
 		File: f,
@@ -110,6 +97,7 @@ func identifier(ctx context.Context, v View, f File, pos token.Pos) (*Identifier
 			}
 		}
 	}
+	var err error
 	if result.Declaration.Range, err = objToRange(ctx, v, result.Declaration.Object); err != nil {
 		return nil, err
 	}
@@ -142,33 +130,6 @@ func objToRange(ctx context.Context, v View, obj types.Object) (Range, error) {
 	if !p.IsValid() {
 		return Range{}, fmt.Errorf("invalid position for %v", obj.Name())
 	}
-	tok := v.FileSet().File(p)
-	pos := tok.Position(p)
-	if pos.Column == 1 {
-		// We do not have full position information because exportdata does not
-		// store the column. For now, we attempt to read the original source
-		// and find the identifier within the line. If we find it, we patch the
-		// column to match its offset.
-		//
-		// TODO: If we parse from source, we will never need this hack.
-		f, err := v.GetFile(ctx, ToURI(pos.Filename))
-		if err != nil {
-			goto Return
-		}
-		src, err := f.Read()
-		if err != nil {
-			goto Return
-		}
-		tok, err := f.GetToken()
-		if err != nil {
-			goto Return
-		}
-		start := lineStart(tok, pos.Line)
-		offset := tok.Offset(start)
-		col := bytes.Index(src[offset:], []byte(obj.Name()))
-		p = tok.Pos(offset + col)
-	}
-Return:
 	return Range{
 		Start: p,
 		End:   p + token.Pos(identifierLen(obj.Name())),

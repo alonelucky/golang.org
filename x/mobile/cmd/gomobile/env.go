@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,10 +47,6 @@ func buildEnvInit() (cleanup func(), err error) {
 		return nil, errors.New("toolchain not installed, run `gomobile init`")
 	}
 
-	if err := envInit(); err != nil {
-		return nil, err
-	}
-
 	cleanupFn := func() {
 		if buildWork {
 			fmt.Printf("WORK=%s\n", tmpdir)
@@ -70,6 +67,10 @@ func buildEnvInit() (cleanup func(), err error) {
 		fmt.Fprintln(xout, "WORK="+tmpdir)
 	}
 
+	if err := envInit(); err != nil {
+		return nil, err
+	}
+
 	return cleanupFn, nil
 }
 
@@ -81,14 +82,14 @@ func envInit() (err error) {
 	}
 
 	// Setup the cross-compiler environments.
-	if hasNDK() {
+	if ndkRoot, err := ndkRoot(); err == nil {
 		androidEnv = make(map[string][]string)
 		for arch, toolchain := range ndk {
 			androidEnv[arch] = []string{
 				"GOOS=android",
 				"GOARCH=" + arch,
-				"CC=" + toolchain.Path("clang"),
-				"CXX=" + toolchain.Path("clang++"),
+				"CC=" + toolchain.Path(ndkRoot, "clang"),
+				"CXX=" + toolchain.Path(ndkRoot, "clang++"),
 				"CGO_ENABLED=1",
 			}
 			if arch == "arm" {
@@ -139,18 +140,30 @@ func envInit() (err error) {
 	return nil
 }
 
-func hasNDK() bool {
+func ndkRoot() (string, error) {
 	if buildN {
-		return true
+		return "$NDK_PATH", nil
 	}
-	tcPath := filepath.Join(gomobilepath, "ndk-toolchains")
-	_, err := os.Stat(tcPath)
-	return err == nil
+	androidHome := os.Getenv("ANDROID_HOME")
+	if androidHome == "" {
+		return "", errors.New("The Android SDK was not found. Please set ANDROID_HOME to the root of the Android SDK.")
+	}
+	ndkRoot := filepath.Join(androidHome, "ndk-bundle")
+	_, err := os.Stat(ndkRoot)
+	if err != nil {
+		return "", fmt.Errorf("The NDK was not found in $ANDROID_HOME/ndk-bundle (%q). Install the NDK with `sdkmanager 'ndk-bundle'`", ndkRoot)
+	}
+	prebuiltPath := filepath.Join(androidHome, "ndk-bundle", "toolchains", "llvm", "prebuilt")
+	_, err = os.Stat(prebuiltPath)
+	if err != nil {
+		return "", fmt.Errorf("No prebuilt toolchains found in $ANDROID_HOME/ndk-bundle/toolchains/llvm/prebuilt (%q). Make sure your NDK version is >= r19b. Use `sdkmanager --update` to update it.", prebuiltPath)
+	}
+	return ndkRoot, nil
 }
 
 func envClang(sdkName string) (clang, cflags string, err error) {
 	if buildN {
-		return "clang-" + sdkName, "-isysroot=" + sdkName, nil
+		return sdkName + "-clang", "-isysroot=" + sdkName, nil
 	}
 	cmd := exec.Command("xcrun", "--sdk", sdkName, "--find", "clang")
 	out, err := cmd.CombinedOutput()
@@ -247,15 +260,49 @@ func archNDK() string {
 }
 
 type ndkToolchain struct {
-	arch       string
-	abi        string
-	platform   string
-	gcc        string
-	toolPrefix string
+	arch        string
+	abi         string
+	toolPrefix  string
+	clangPrefix string
 }
 
-func (tc *ndkToolchain) Path(toolName string) string {
-	return filepath.Join(gomobilepath, "ndk-toolchains", tc.arch, "bin", tc.toolPrefix+"-"+toolName)
+func (tc *ndkToolchain) Path(ndkRoot, toolName string) string {
+	var pref string
+	switch toolName {
+	case "clang", "clang++":
+		if runtime.GOOS == "windows" {
+			return tc.createNDKr19bWorkaroundTool(ndkRoot, toolName)
+		}
+		pref = tc.clangPrefix
+	default:
+		pref = tc.toolPrefix
+	}
+	return filepath.Join(ndkRoot, "toolchains", "llvm", "prebuilt", archNDK(), "bin", pref+"-"+toolName)
+}
+
+// createNDKr19bWorkaroundTool creates a Windows wrapper script for clang or clang++.
+// The scripts included in r19b are broken on Windows: https://github.com/android-ndk/ndk/issues/920.
+// TODO: Remove this when r19c is out; the code inside is hacky and panicky.
+func (tc *ndkToolchain) createNDKr19bWorkaroundTool(ndkRoot, toolName string) string {
+	toolCmd := filepath.Join(tmpdir, fmt.Sprintf("%s-%s.cmd", tc.arch, toolName))
+	tool, err := os.Create(toolCmd)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := tool.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+	tcBin := filepath.Join(ndkRoot, "toolchains", "llvm", "prebuilt", archNDK(), "bin")
+	// Adapted from the NDK cmd wrappers.
+	toolCmdContent := fmt.Sprintf(`@echo off
+set _BIN_DIR=%s\
+%%_BIN_DIR%%%s.exe --target=%s -fno-addrsig %%*"`, tcBin, toolName, tc.clangPrefix)
+	if _, err = tool.Write([]byte(toolCmdContent)); err != nil {
+		log.Fatal(err)
+	}
+	return toolCmd
 }
 
 type ndkConfig map[string]ndkToolchain // map: GOOS->androidConfig.
@@ -270,33 +317,29 @@ func (nc ndkConfig) Toolchain(arch string) ndkToolchain {
 
 var ndk = ndkConfig{
 	"arm": {
-		arch:       "arm",
-		abi:        "armeabi-v7a",
-		platform:   "android-16",
-		gcc:        "arm-linux-androideabi-4.9",
-		toolPrefix: "arm-linux-androideabi",
+		arch:        "arm",
+		abi:         "armeabi-v7a",
+		toolPrefix:  "arm-linux-androideabi",
+		clangPrefix: "armv7a-linux-androideabi16",
 	},
 	"arm64": {
-		arch:       "arm64",
-		abi:        "arm64-v8a",
-		platform:   "android-21",
-		gcc:        "aarch64-linux-android-4.9",
-		toolPrefix: "aarch64-linux-android",
+		arch:        "arm64",
+		abi:         "arm64-v8a",
+		toolPrefix:  "aarch64-linux-android",
+		clangPrefix: "aarch64-linux-android21",
 	},
 
 	"386": {
-		arch:       "x86",
-		abi:        "x86",
-		platform:   "android-16",
-		gcc:        "x86-4.9",
-		toolPrefix: "i686-linux-android",
+		arch:        "x86",
+		abi:         "x86",
+		toolPrefix:  "i686-linux-android",
+		clangPrefix: "i686-linux-android16",
 	},
 	"amd64": {
-		arch:       "x86_64",
-		abi:        "x86_64",
-		platform:   "android-21",
-		gcc:        "x86_64-4.9",
-		toolPrefix: "x86_64-linux-android",
+		arch:        "x86_64",
+		abi:         "x86_64",
+		toolPrefix:  "x86_64-linux-android",
+		clangPrefix: "x86_64-linux-android21",
 	},
 }
 
