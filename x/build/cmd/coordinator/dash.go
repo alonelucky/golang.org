@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build linux
+// +build linux darwin
 
 // Code interacting with build.golang.org ("the dashboard").
 
@@ -130,7 +130,7 @@ func recordResult(br buildgo.BuilderRev, ok bool, buildLog string, runTime time.
 // pingDashboard runs in its own goroutine, created periodically to
 // POST to build.golang.org/building to let it know that we're still working on a build.
 func (st *buildStatus) pingDashboard() {
-	if st.conf.TryOnly {
+	if st.conf.IsTryOnly() {
 		// Builders that are trybot-only don't appear on the dashboard.
 		return
 	}

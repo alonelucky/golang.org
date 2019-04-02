@@ -13,6 +13,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -24,10 +25,6 @@ import (
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/packages/packagestest"
 )
-
-// TODO(matloob): remove this once Go 1.12 is released as we will end support
-// for versions of go list before Go 1.10.4.
-var usesOldGolist = false
 
 // TODO(adonovan): more test cases to write:
 //
@@ -316,6 +313,29 @@ func TestLoadAbsolutePath(t *testing.T) {
 	}
 }
 
+func TestReturnErrorWhenUsingNonGoFiles(t *testing.T) {
+	exported := packagestest.Export(t, packagestest.GOPATH, []packagestest.Module{{
+		Name: "golang.org/gopatha",
+		Files: map[string]interface{}{
+			"a/a.go": `package a`,
+		}}, {
+		Name: "golang.org/gopathb",
+		Files: map[string]interface{}{
+			"b/b.c": `package b`,
+		}}})
+	defer exported.Cleanup()
+	config := packages.Config{}
+	_, err := packages.Load(&config, "a/a.go", "b/b.c")
+	if err == nil {
+		t.Fatalf("should have failed with an error")
+	}
+	got := err.Error()
+	want := "named files must be .go files"
+	if !strings.Contains(got, want) {
+		t.Fatalf("want error message: %s, got: %s", want, got)
+	}
+}
+
 func TestVendorImports(t *testing.T) {
 	exported := packagestest.Export(t, packagestest.GOPATH, []packagestest.Module{{
 		Name: "golang.org/fake",
@@ -534,22 +554,14 @@ func testLoadTypes(t *testing.T, exporter packagestest.Exporter) {
 		t.Errorf("wrong import graph: got <<%s>>, want <<%s>>", graph, wantGraph)
 	}
 
-	for _, test := range []struct {
-		id         string
-		wantSyntax bool
-	}{
-		{"golang.org/fake/a", true},  // need src, no export data for c
-		{"golang.org/fake/b", false}, // use export data
-		{"golang.org/fake/c", true},  // need src, no export data for c
+	for _, id := range []string{
+		"golang.org/fake/a",
+		"golang.org/fake/b",
+		"golang.org/fake/c",
 	} {
-		if usesOldGolist && !test.wantSyntax {
-			// legacy go list always upgrades to LoadAllSyntax, syntax will be filled in.
-			// still check that types information is complete.
-			test.wantSyntax = true
-		}
-		p := all[test.id]
+		p := all[id]
 		if p == nil {
-			t.Errorf("missing package: %s", test.id)
+			t.Errorf("missing package: %s", id)
 			continue
 		}
 		if p.Types == nil {
@@ -557,14 +569,10 @@ func testLoadTypes(t *testing.T, exporter packagestest.Exporter) {
 			continue
 		} else if !p.Types.Complete() {
 			t.Errorf("incomplete types.Package for %s", p)
+		} else if p.TypesSizes == nil {
+			t.Errorf("TypesSizes is not filled in for %s", p)
 		}
-		if (p.Syntax != nil) != test.wantSyntax {
-			if test.wantSyntax {
-				t.Errorf("missing ast.Files for %s", p)
-			} else {
-				t.Errorf("unexpected ast.Files for for %s", p)
-			}
-		}
+
 	}
 }
 
@@ -607,25 +615,18 @@ func testLoadSyntaxOK(t *testing.T, exporter packagestest.Exporter) {
 	}
 
 	for _, test := range []struct {
-		id           string
-		wantSyntax   bool
-		wantComplete bool
+		id string
 	}{
-		{"golang.org/fake/a", true, true},   // source package
-		{"golang.org/fake/b", true, true},   // source package
-		{"golang.org/fake/c", true, true},   // source package
-		{"golang.org/fake/d", false, true},  // export data package
-		{"golang.org/fake/e", false, false}, // export data package
-		{"golang.org/fake/f", false, false}, // export data package
+		{"golang.org/fake/a"}, // source package
+		{"golang.org/fake/b"}, // source package
+		{"golang.org/fake/c"}, // source package
+		{"golang.org/fake/d"}, // export data package
+		{"golang.org/fake/e"}, // export data package
+		{"golang.org/fake/f"}, // export data package
 	} {
-		// TODO(matloob): The legacy go list based support loads
-		// everything from source because it doesn't do a build
-		// and the .a files don't exist.
-		// Can we simulate its existence?
-		if usesOldGolist {
-			test.wantComplete = true
-			test.wantSyntax = true
-		}
+		// TODO(matloob): LoadSyntax and LoadAllSyntax are now equivalent, wantSyntax and wantComplete
+		// are true for all packages in the transitive dependency set. Add test cases on the individual
+		// Need* fields to check the equivalents on the new API.
 		p := all[test.id]
 		if p == nil {
 			t.Errorf("missing package: %s", test.id)
@@ -634,19 +635,9 @@ func testLoadSyntaxOK(t *testing.T, exporter packagestest.Exporter) {
 		if p.Types == nil {
 			t.Errorf("missing types.Package for %s", p)
 			continue
-		} else if p.Types.Complete() != test.wantComplete {
-			if test.wantComplete {
-				t.Errorf("incomplete types.Package for %s", p)
-			} else {
-				t.Errorf("unexpected complete types.Package for %s", p)
-			}
 		}
-		if (p.Syntax != nil) != test.wantSyntax {
-			if test.wantSyntax {
-				t.Errorf("missing ast.Files for %s", p)
-			} else {
-				t.Errorf("unexpected ast.Files for for %s", p)
-			}
+		if p.Syntax == nil {
+			t.Errorf("missing ast.Files for %s", p)
 		}
 		if p.Errors != nil {
 			t.Errorf("errors in package: %s: %s", p, p.Errors)
@@ -742,12 +733,8 @@ func testLoadSyntaxError(t *testing.T, exporter packagestest.Exporter) {
 		{"golang.org/fake/c", true, true},
 		{"golang.org/fake/d", true, true},
 		{"golang.org/fake/e", true, true},
-		{"golang.org/fake/f", false, false},
+		{"golang.org/fake/f", true, false},
 	} {
-		if usesOldGolist && !test.wantSyntax {
-			// legacy go list always upgrades to LoadAllSyntax, syntax will be filled in.
-			test.wantSyntax = true
-		}
 		p := all[test.id]
 		if p == nil {
 			t.Errorf("missing package: %s", test.id)
@@ -1193,10 +1180,6 @@ func testName(t *testing.T, exporter packagestest.Exporter) {
 }
 
 func TestName_Modules(t *testing.T) {
-	if usesOldGolist {
-		t.Skip("pre-modules version of Go")
-	}
-
 	// Test the top-level package case described in runNamedQueries.
 	// Note that overriding GOPATH below prevents Export from
 	// creating more than one module.
@@ -1211,12 +1194,20 @@ func TestName_Modules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	gopath, err := ioutil.TempDir("", "TestName_Modules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(gopath)
+	if err := copyAll(filepath.Join(wd, "testdata", "TestName_Modules"), gopath); err != nil {
+		t.Fatal(err)
+	}
 	// testdata/TestNamed_Modules contains:
 	// - pkg/mod/github.com/heschik/tools-testrepo@v1.0.0/pkg
 	// - pkg/mod/github.com/heschik/tools-testrepo/v2@v2.0.0/pkg
 	// - src/b/pkg
 	exported.Config.Mode = packages.LoadImports
-	exported.Config.Env = append(exported.Config.Env, "GOPATH="+wd+"/testdata/TestName_Modules")
+	exported.Config.Env = append(exported.Config.Env, "GOPATH="+gopath)
 	initial, err := packages.Load(exported.Config, "iamashamedtousethedisabledqueryname=pkg")
 	if err != nil {
 		t.Fatal(err)
@@ -1233,10 +1224,6 @@ func TestName_Modules(t *testing.T) {
 }
 
 func TestName_ModulesDedup(t *testing.T) {
-	if usesOldGolist {
-		t.Skip("pre-modules version of Go")
-	}
-
 	exported := packagestest.Export(t, packagestest.Modules, []packagestest.Module{{
 		Name: "golang.org/fake",
 		Files: map[string]interface{}{
@@ -1248,13 +1235,21 @@ func TestName_ModulesDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	gopath, err := ioutil.TempDir("", "TestName_ModulesDedup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(gopath)
+	if err := copyAll(filepath.Join(wd, "testdata", "TestName_ModulesDedup"), gopath); err != nil {
+		t.Fatal(err)
+	}
 	// testdata/TestNamed_ModulesDedup contains:
 	// - pkg/mod/github.com/heschik/tools-testrepo/v2@v2.0.2/pkg/pkg.go
 	// - pkg/mod/github.com/heschik/tools-testrepo/v2@v2.0.1/pkg/pkg.go
 	// - pkg/mod/github.com/heschik/tools-testrepo@v1.0.0/pkg/pkg.go
 	// but, inexplicably, not v2.0.0. Nobody knows why.
 	exported.Config.Mode = packages.LoadImports
-	exported.Config.Env = append(exported.Config.Env, "GOPATH="+wd+"/testdata/TestName_ModulesDedup")
+	exported.Config.Env = append(exported.Config.Env, "GOPATH="+gopath)
 	initial, err := packages.Load(exported.Config, "iamashamedtousethedisabledqueryname=pkg")
 	if err != nil {
 		t.Fatal(err)
@@ -1756,4 +1751,28 @@ func constant(p *packages.Package, name string) *types.Const {
 		return nil
 	}
 	return c.(*types.Const)
+}
+
+func copyAll(srcPath, dstPath string) error {
+	return filepath.Walk(srcPath, func(path string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			return nil
+		}
+		contents, err := ioutil.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcPath, path)
+		if err != nil {
+			return err
+		}
+		dstFilePath := filepath.Join(dstPath, rel)
+		if err := os.MkdirAll(filepath.Dir(dstFilePath), 0755); err != nil {
+			return err
+		}
+		if err := ioutil.WriteFile(dstFilePath, contents, 0644); err != nil {
+			return err
+		}
+		return nil
+	})
 }

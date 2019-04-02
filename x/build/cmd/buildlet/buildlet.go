@@ -73,7 +73,8 @@ var (
 //   16: make macstadium builders always haltEntireOS
 //   17: make macstadium halts use sudo
 //   18: set TMPDIR and GOCACHE
-const buildletVersion = 18
+//   21: GO_BUILDER_SET_GOPROXY=coordinator support
+const buildletVersion = 21
 
 func defaultListenAddr() string {
 	if runtime.GOOS == "darwin" {
@@ -926,6 +927,18 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 
 	env := append(baseEnv(goarch), postEnv...)
 
+	// Setup an localhost HTTP server to proxy module cache, if requested by environment.
+	if goproxyHandler != nil && getEnv(postEnv, "GO_BUILDER_SET_GOPROXY") == "coordinator" {
+		ln, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			http.Error(w, "failed to listen on localhost for GOPROXY=coordinator: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer ln.Close()
+		srv := &http.Server{Handler: goproxyHandler}
+		go srv.Serve(ln)
+		env = append(env, fmt.Sprintf("GOPROXY=http://localhost:%d", ln.Addr().(*net.TCPAddr).Port))
+	}
 	if v := processTmpDirEnv; v != "" {
 		env = append(env, "TMPDIR="+v)
 	}
@@ -1643,6 +1656,10 @@ func configureMacStadium() {
 
 	disableMacScreensaver()
 
+	// Enable developer mode for runtime tests. (Issue 31123)
+	// Best effort; ignore any error.
+	exec.Command("/usr/sbin/DevToolsSecurity", "-enable").Run()
+
 	version, err := exec.Command("sw_vers", "-productVersion").Output()
 	if err != nil {
 		log.Fatalf("failed to find sw_vers -productVersion: %v", err)
@@ -1653,7 +1670,11 @@ func configureMacStadium() {
 		log.Fatalf("unsupported sw_vers version %q", version)
 	}
 	major, minor := m[1], m[2] // "10", "12"
-	*reverse = "darwin-amd64-" + major + "_" + minor
+	if m, _ := strconv.Atoi(minor); m >= 13 {
+		*reverseType = "host-darwin-10_" + minor
+	} else {
+		*reverse = "darwin-amd64-" + major + "_" + minor
+	}
 	*coordinator = "farmer.golang.org:443"
 
 	// guestName is set by cmd/makemac to something like
