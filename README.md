@@ -36,3 +36,6 @@ for u in ${urls[@]};do
   rm master.zip
 done;
 ```
+
+## 若觉得麻烦，或1.11以后的go mod 模式，可以配置go proxy 代理服务
+[Go module 私服](https://qiubo.ink/2019/03/19/go-module-e7-a7-81-e6-9c-8d/)
