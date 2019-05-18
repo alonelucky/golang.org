@@ -1,12 +1,11 @@
-.PHONY: update-deps docker test
+.PHONY: docker test
 
-update-deps:
-	go install golang.org/x/build/cmd/gitlock
-	gitlock --update=Dockerfile golang.org/x/playground
+docker:
+	docker build -t golang/playground .
 
-docker: Dockerfile
-	docker build -t playground .
-
-test: docker
-	go test
-	docker run --rm playground test
+test:
+	# Run fast tests first: (and tests whether, say, things compile)
+	GO111MODULE=on go test -v
+	# Then run the slower tests, which happen as one of the
+	# Dockerfile RUN steps:
+	docker build -t golang/playground .

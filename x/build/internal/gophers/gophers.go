@@ -17,8 +17,8 @@ type Person struct {
 	Github  string   // "FooBar" (orig case, no '@')
 	Gerrit  string   // "foo@bar.com" (lowercase)
 	Emails  []string // all lower
-	Googler bool
-	Bot     bool
+	Googler bool     // whether person is (or was) a Googler; determined via heuristics
+	Bot     bool     // whether it's a known bot (GopherBot, Gerrit Bot)
 }
 
 func strSliceContains(ss []string, s string) bool {
@@ -568,6 +568,7 @@ func init() {
 	addPerson("ChaiShushan", "chaishushan@gmail.com", "@chai2010")
 	addPerson("Chance Zibolski", "chance.zibolski@coreos.com")
 	addPerson("Changsoo Kim", "broodkcs@gmail.com")
+	addPerson("Channing Kimble-Brown", "channing@golang.org", "@cnoellekb")
 	addPerson("Charle Demers", "charle.demers@gmail.com")
 	addPerson("Charles Fenwick Elliott", "Charles@FenwickElliott.io")
 	addPerson("Charles Kenney", "charlesc.kenney@gmail.com", "@Charliekenney23")
@@ -999,10 +1000,9 @@ func init() {
 	addPerson("Filip Haglund", "drathier@users.noreply.github.com")
 	addPerson("Filip Ochnik", "filip.ochnik@gmail.com")
 	addPerson("Filip Stanis", "fstanis@google.com")
-	addPerson("Filippo Valsorda", "", "6195@62eb7196-b449-3ce5-99f1-c037f21e1705")
-	addPerson("Filippo Valsorda", "filippo@cloudflare.com")
 	addPerson("Filippo Valsorda", "filippo@golang.org", "11715@62eb7196-b449-3ce5-99f1-c037f21e1705")
-	addPerson("Filippo Valsorda", "filippo@golang.org", "hi@filippo.io", "@FiloSottile")
+	addPerson("Filippo Valsorda", "hi@filippo.io", "@FiloSottile", "filippo@cloudflare.com")
+	addPerson("Filippo Valsorda", "6195@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("Firmansyah Adiputra", "frm.adiputra@gmail.com", "@frm-adiputra")
 	addPerson("Florian Forster", "octo@google.com", "@octo")
 	addPerson("Florian Uekermann", "florian@uekermann.me", "13410@62eb7196-b449-3ce5-99f1-c037f21e1705")
@@ -1232,6 +1232,7 @@ func init() {
 	addPerson("Ivan Ukhov", "ivan.ukhov@gmail.com", "@IvanUkhov")
 	addPerson("Ivy Evans", "ivy@ivyevans.net", "@ivy")
 	addPerson("J. Mroz", "nalik.nal@gmail.com")
+	addPerson("Jay Conrod", "jayconrod@google.com", "@jayconrod")
 	addPerson("JBD (DO NOT USE)", "jbd@golang.org", "10107@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("JBD", "jbd@google.com", "5040@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("JP Sugarbroad", "jpsugar@google.com", "@taralx")

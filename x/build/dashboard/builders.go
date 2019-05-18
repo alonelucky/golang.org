@@ -77,12 +77,6 @@ var Hosts = map[string]*HostConfig{
 		Notes:       "for localhost development of buildlets/gomote/coordinator only",
 		SSHUsername: os.Getenv("USER"),
 	},
-	"host-nacl-arm-davecheney": &HostConfig{
-		IsReverse:   true,
-		ExpectNum:   1,
-		Notes:       "Raspberry Pi 3",
-		OwnerGithub: "davecheney",
-	},
 	"host-nacl-kube": &HostConfig{
 		Notes:           "Container with Native Client binaries.",
 		ContainerImage:  "linux-x86-nacl:latest",
@@ -118,6 +112,12 @@ var Hosts = map[string]*HostConfig{
 		ContainerImage:  "linux-x86-sid:latest",
 		buildletURLTmpl: "http://storage.googleapis.com/$BUCKET/buildlet.linux-amd64",
 		env:             []string{"GOROOT_BOOTSTRAP=/go1.4"},
+	},
+	"host-linux-fedora": &HostConfig{
+		Notes:           "Fedora 30",
+		ContainerImage:  "linux-x86-fedora:latest",
+		buildletURLTmpl: "http://storage.googleapis.com/$BUCKET/buildlet.linux-amd64",
+		env:             []string{"GOROOT_BOOTSTRAP=/goboot"},
 	},
 	"host-linux-arm-scaleway": &HostConfig{
 		IsReverse:       true,
@@ -243,7 +243,7 @@ var Hosts = map[string]*HostConfig{
 	// Note: the netbsd-386 host hangs during the ../test phase of all.bash,
 	// so we don't use this for now. (See the netbsd-386-8 BuildConfig below.)
 	"host-netbsd-386-8_0": &HostConfig{
-		VMImage:            "netbsd-386-8-0-2018q1",
+		VMImage:            "netbsd-i386-8-0-2018q1",
 		Notes:              "NetBSD 8.0RC1; GCE VM is built from script in build/env/netbsd-386",
 		machineType:        "n1-highcpu-4",
 		buildletURLTmpl:    "http://storage.googleapis.com/$BUCKET/buildlet.netbsd-386",
@@ -278,6 +278,11 @@ var Hosts = map[string]*HostConfig{
 		OwnerGithub: "0intro",
 	},
 	"host-plan9-amd64-0intro": &HostConfig{
+		IsReverse:   true,
+		ExpectNum:   1,
+		OwnerGithub: "0intro",
+	},
+	"host-plan9-386-0intro": &HostConfig{
 		IsReverse:   true,
 		ExpectNum:   1,
 		OwnerGithub: "0intro",
@@ -445,23 +450,15 @@ var Hosts = map[string]*HostConfig{
 	},
 	"host-solaris-oracle-amd64-oraclerel": &HostConfig{
 		Notes:       "Oracle Solaris amd64 Release System",
-		Owner:       "shawn.walker@oracle.com",
-		OwnerGithub: "binarycrusader",
-		IsReverse:   true,
-		ExpectNum:   1,
-		env:         []string{"GOROOT_BOOTSTRAP=/opt/golang/go-solaris-amd64-bootstrap"},
-	},
-	"host-solaris-oracle-shawn": &HostConfig{
-		Notes:       "Oracle Solaris amd64 Development System",
-		Owner:       "shawn.walker@oracle.com",
-		OwnerGithub: "binarycrusader",
+		Owner:       "", // TODO: find current owner
+		OwnerGithub: "", // TODO: find current owner
 		IsReverse:   true,
 		ExpectNum:   1,
 		env:         []string{"GOROOT_BOOTSTRAP=/opt/golang/go-solaris-amd64-bootstrap"},
 	},
 	"host-linux-mips": &HostConfig{
-		Notes:       "Run by Brendan Kirby, imgtec.com",
-		OwnerGithub: "MIPSbkirby",
+		Notes:       "", // once ran by Brendan Kirby (@MIPSbkirby), imgtec.com; email bounces
+		OwnerGithub: "",
 		IsReverse:   true,
 		ExpectNum:   1,
 		env: []string{
@@ -473,8 +470,8 @@ var Hosts = map[string]*HostConfig{
 		ReverseAliases: []string{"linux-mips"},
 	},
 	"host-linux-mipsle": &HostConfig{
-		Notes:       "Run by Brendan Kirby, imgtec.com",
-		OwnerGithub: "MIPSbkirby",
+		Notes:       "", // once ran by Brendan Kirby (@MIPSbkirby), imgtec.com; email bounces
+		OwnerGithub: "",
 		IsReverse:   true,
 		ExpectNum:   1,
 		env: []string{
@@ -485,8 +482,8 @@ var Hosts = map[string]*HostConfig{
 		ReverseAliases: []string{"linux-mipsle"},
 	},
 	"host-linux-mips64": &HostConfig{
-		Notes:       "Run by Brendan Kirby, imgtec.com",
-		OwnerGithub: "MIPSbkirby",
+		Notes:       "", // once ran by Brendan Kirby (@MIPSbkirby), imgtec.com; email bounces
+		OwnerGithub: "",
 		IsReverse:   true,
 		ExpectNum:   1,
 		env: []string{
@@ -498,8 +495,8 @@ var Hosts = map[string]*HostConfig{
 		ReverseAliases: []string{"linux-mips64"},
 	},
 	"host-linux-mips64le": &HostConfig{
-		Notes:       "Run by Brendan Kirby, imgtec.com",
-		OwnerGithub: "MIPSbkirby",
+		Notes:       "", // once ran by Brendan Kirby (@MIPSbkirby), imgtec.com; email bounces
+		OwnerGithub: "",
 		IsReverse:   true,
 		ExpectNum:   1,
 		env: []string{
@@ -509,27 +506,6 @@ var Hosts = map[string]*HostConfig{
 		},
 		ReverseAliases: []string{"linux-mips64le"},
 	},
-	"host-darwin-amd64-eliasnaur-android": &HostConfig{
-		Notes:       "Mac Mini hosted by Elias Naur, running the android reverse buildlet",
-		OwnerGithub: "eliasnaur",
-		IsReverse:   true,
-		ExpectNum:   1,
-		env: []string{
-			"GOROOT_BOOTSTRAP=/usr/local/go-bootstrap",
-			"GOHOSTARCH=amd64",
-			"GOOS=android",
-		},
-	},
-	"host-darwin-amd64-eliasnaur-ios": &HostConfig{
-		Notes:       "Mac Mini hosted by Elias Naur, running the ios reverse buildlet",
-		OwnerGithub: "eliasnaur",
-		IsReverse:   true,
-		ExpectNum:   1,
-		env: []string{
-			"GOROOT_BOOTSTRAP=/usr/local/go-bootstrap",
-			"GOHOSTARCH=amd64",
-		},
-	},
 	"host-darwin-amd64-zenly-ios": &HostConfig{
 		Notes:       "MacBook Pro hosted by Zenly, running the ios reverse buildlet",
 		OwnerGithub: "znly",
@@ -538,6 +514,24 @@ var Hosts = map[string]*HostConfig{
 		env: []string{
 			"GOROOT_BOOTSTRAP=/usr/local/Cellar/1.10.3/libexec",
 			"GOHOSTARCH=amd64",
+		},
+	},
+	"host-darwin-arm64-corellium-ios": &HostConfig{
+		Notes:       "Virtual iOS devices hosted by Zenly on Corellium",
+		OwnerGithub: "znly",
+		IsReverse:   true,
+		ExpectNum:   3,
+		env: []string{
+			"GOROOT_BOOTSTRAP=/var/mobile/go-darwin-arm64-bootstrap",
+		},
+	},
+	"host-android-arm64-corellium-android": &HostConfig{
+		Notes:       "Virtual Android devices hosted by Zenly on Corellium",
+		OwnerGithub: "znly",
+		IsReverse:   true,
+		ExpectNum:   3,
+		env: []string{
+			"GOROOT_BOOTSTRAP=/data/data/com.termux/files/home/go-android-arm64-bootstrap",
 		},
 	},
 	"host-aix-ppc64-osuosl": &HostConfig{
@@ -769,7 +763,7 @@ func (c *BuildConfig) Env() []string {
 // ("go", "oauth2", "net", etc).
 func (c *BuildConfig) ModulesEnv(repo string) (env []string) {
 	if c.IsReverse() && repo != "go" {
-		env = append(env, "GO_BUILDER_SET_GOPROXY=coordinator")
+		env = append(env, "GOPROXY=https://proxy.golang.org")
 	}
 	switch repo {
 	case "go":
@@ -876,7 +870,7 @@ func (c *BuildConfig) IsLongTest() bool {
 // allowed to make outbound network requests. This is only enforced
 // on some builders. (Currently most Linux ones)
 func (c *BuildConfig) OutboundNetworkAllowed() bool {
-	return c.Name == "misc-vet-vetall" || c.IsLongTest()
+	return c.IsLongTest()
 }
 
 func (c *BuildConfig) GoInstallRacePackages() []string {
@@ -911,7 +905,7 @@ func (c *BuildConfig) AllScript() string {
 	if strings.HasPrefix(c.Name, "nacl-") {
 		return "src/nacltest.bash"
 	}
-	if strings.HasPrefix(c.Name, "darwin-arm") {
+	if strings.HasPrefix(c.Name, "darwin-arm") && !strings.Contains(c.Name, "corellium") {
 		return "src/iostest.bash"
 	}
 	if strings.HasPrefix(c.Name, "misc-compile") {
@@ -972,7 +966,6 @@ func (c *BuildConfig) BuildsRepoTryBot(repo, branch, goBranch string) bool {
 // otherwise. Certain portable, slow tests are only run on fast builders in
 // trybot mode.
 func (c *BuildConfig) ShouldRunDistTest(distTest string, isTry bool) bool {
-	// TODO: add a table of tests in builders_test.go.
 	if c.shouldRunDistTest != nil {
 		return c.shouldRunDistTest(distTest, isTry)
 	}
@@ -1019,6 +1012,10 @@ func (c *BuildConfig) buildsRepoAtAll(repo, branch, goBranch string) bool {
 			if bmm.Less(c.MinimumGoVersion) {
 				return false
 			}
+			if repo == "exp" {
+				// Don't test exp against release branches; it's experimental.
+				return false
+			}
 		}
 	}
 
@@ -1028,33 +1025,40 @@ func (c *BuildConfig) buildsRepoAtAll(repo, branch, goBranch string) bool {
 			return false
 		}
 	}
-
+	if repo != "go" && !c.SplitMakeRun() {
+		return false
+	}
 	if p := c.buildsRepo; p != nil {
 		return p(repo, branch, goBranch)
 	}
-	if repo == "go" {
-		return true
-	}
-	if !c.SplitMakeRun() {
-		return false
-	}
+	return defaultBuildsRepoPolicy(repo, branch, goBranch)
+}
+
+func defaultBuildsRepoPolicy(repo, branch, goBranch string) bool {
 	switch repo {
 	case "go":
 		return true
 	case "term":
 		// no code yet in repo
 		return false
-	case "mobile":
-		// Mobile is opt-in.
+	case "mobile", "exp":
+		// mobile and exp are opt-in.
 		return false
 	}
 	return true
 }
 
+func defaultPlusExp(repo, branch, goBranch string) bool {
+	if repo == "exp" {
+		return true
+	}
+	return defaultBuildsRepoPolicy(repo, branch, goBranch)
+}
+
 // AllScriptArgs returns the set of arguments that should be passed to the
 // all.bash-equivalent script. Usually empty.
 func (c *BuildConfig) AllScriptArgs() []string {
-	if strings.HasPrefix(c.Name, "darwin-arm") {
+	if strings.HasPrefix(c.Name, "darwin-arm") && !strings.Contains(c.Name, "corellium") {
 		return []string{"-restart"}
 	}
 	return append([]string(nil), c.allScriptArgs...)
@@ -1271,6 +1275,12 @@ func init() {
 		HostType:          "host-freebsd-12_0",
 		env:               []string{"GOARCH=386", "GOHOSTARCH=386"},
 		shouldRunDistTest: fasterTrybots,
+		buildsRepo: func(repo, branch, goBranch string) bool {
+			if repo == "net" && branch == "master" && goBranch == "release-branch.go1.11" {
+				return false
+			}
+			return defaultBuildsRepoPolicy(repo, branch, goBranch)
+		},
 		numTryTestHelpers: 4,
 		MaxAtOnce:         2,
 	})
@@ -1311,9 +1321,15 @@ func init() {
 		Name:              "freebsd-386-11_2",
 		HostType:          "host-freebsd-11_2",
 		shouldRunDistTest: noTestDir,
-		tryBot:            explicitTrySet("sys"),
-		env:               []string{"GOARCH=386", "GOHOSTARCH=386"},
-		MaxAtOnce:         2,
+		buildsRepo: func(repo, branch, goBranch string) bool {
+			if repo == "net" && branch == "master" && goBranch == "release-branch.go1.11" {
+				return false
+			}
+			return defaultBuildsRepoPolicy(repo, branch, goBranch)
+		},
+		tryBot:    explicitTrySet("sys"),
+		env:       []string{"GOARCH=386", "GOHOSTARCH=386"},
+		MaxAtOnce: 2,
 	})
 	addBuilder(BuildConfig{
 		Name:              "linux-386",
@@ -1338,9 +1354,10 @@ func init() {
 		env:      []string{"GOARCH=386", "GOHOSTARCH=386", "GO386=387"},
 	})
 	addBuilder(BuildConfig{
-		Name:     "linux-amd64",
-		HostType: "host-linux-stretch",
-		tryBot:   defaultTrySet(),
+		Name:       "linux-amd64",
+		HostType:   "host-linux-stretch",
+		tryBot:     defaultTrySet(),
+		buildsRepo: defaultPlusExp,
 		env: []string{
 			"GO_DISABLE_OUTBOUND_NETWORK=1",
 		},
@@ -1364,22 +1381,11 @@ func init() {
 		})
 	}
 
-	// Add the -vetall builder. The builder name suffix "-vetall" is recognized by cmd/dist/test.go
-	// to only run the "go vet std cmd" test and no others.
-	addBuilder(BuildConfig{
-		Name:     "misc-vet-vetall",
-		HostType: "host-linux-jessie",
-		Notes:    "Runs vet over the standard library.",
-		buildsRepo: func(repo, branch, goBranch string) bool {
-			return repo == "go" && branch == "master"
-		},
-		tryBot: defaultTrySet(),
-		env: []string{
-			"GO_DISABLE_OUTBOUND_NETWORK=1",
-		},
-		numTestHelpers: 5,
-	})
-
+	// addMiscCompile adds a misc-compile builder that runs
+	// buildall.bash on a subset of platforms matching the egrep
+	// pattern rx. The pattern is matched against the "go tool
+	// dist list" name, but with hyphens instead of forward
+	// slashes ("linux-amd64", etc).
 	addMiscCompile := func(suffix, rx string) {
 		addBuilder(BuildConfig{
 			Name:     "misc-compile" + suffix,
@@ -1390,23 +1396,28 @@ func init() {
 			},
 			tryOnly:     true,
 			CompileOnly: true,
-			Notes:       "Runs buildall.sh to cross-compile std packages for " + rx + ", but doesn't run any tests.",
+			Notes:       "Runs buildall.sh to cross-compile & vet std+cmd packages for " + rx + ", but doesn't run any tests.",
 			allScriptArgs: []string{
 				// Filtering pattern to buildall.bash:
 				rx,
 			},
 		})
 	}
-	addMiscCompile("", "^(linux-arm64|linux-s390x|solaris-amd64|darwin-386)$") // 4 ports
-	addMiscCompile("-nacl", "^nacl")                                           // 3
-	addMiscCompile("-mips", "^linux-mips")                                     // 4
-	addMiscCompile("-ppc", "^linux-ppc64")                                     // 2
-	addMiscCompile("-plan9", "^plan9-")                                        // 3
-	addMiscCompile("-freebsd", "^freebsd-")                                    // 3
-	addMiscCompile("-netbsd", "^netbsd-")                                      // 3
-	addMiscCompile("-openbsd", "^openbsd-")                                    // 3
-	// TODO: Issue 25963, get the misc-compile trybots for mobile working, and then:
-	// addMiscCompile("-mobile", "(^android|darwin-arm64)")                       // 5 ports
+	addMiscCompile("-linuxarm", "^linux-arm")        // 2: arm, arm64
+	addMiscCompile("-darwin", "^darwin")             // 4: 386, amd64 + iOS: armb, arm64
+	addMiscCompile("-nacl", "^nacl")                 // 3: arm, 386, amd64p32
+	addMiscCompile("-mips", "^linux-mips")           // 4: mips, mipsle, mips64, mips64le
+	addMiscCompile("-ppc", "^(linux-ppc64|aix-)")    // 3: linux-ppc64{,le}, aix-ppc64
+	addMiscCompile("-solaris", "^(solaris|illumos)") // 2: both amd64
+	addMiscCompile("-plan9", "^plan9-")              // 3: amd64, 386, arm
+	addMiscCompile("-freebsd", "^freebsd-(386|arm)") // 2: 386, arm (amd64 already trybot)
+	addMiscCompile("-netbsd", "^netbsd-")            // 4: amd64, 386, arm, arm64
+	addMiscCompile("-openbsd", "^openbsd-")          // 4: amd64, 386, arm, arm64
+	// And 3 that don't fit above:
+	addMiscCompile("-other", "^(windows-arm|linux-s390x|dragonfly-amd64)$")
+	// TODO: Issue 25963, get the misc-compile trybots for
+	// subrepos too, so "mobile" can at least be included as a
+	// misc-compile for ^android- and ^darwin-arm.
 
 	addBuilder(BuildConfig{
 		Name:      "linux-amd64-nocgo",
@@ -1480,6 +1491,7 @@ func init() {
 		Name:              "linux-amd64-race",
 		HostType:          "host-linux-jessie",
 		tryBot:            defaultTrySet(),
+		buildsRepo:        defaultPlusExp,
 		MaxAtOnce:         1,
 		shouldRunDistTest: fasterTrybots,
 		numTestHelpers:    1,
@@ -1516,6 +1528,12 @@ func init() {
 		Notes:     "Debian sid (unstable)",
 	})
 	addBuilder(BuildConfig{
+		Name:      "linux-amd64-fedora",
+		HostType:  "host-linux-fedora",
+		MaxAtOnce: 1,
+		Notes:     "Fedora",
+	})
+	addBuilder(BuildConfig{
 		Name:     "linux-amd64-androidemu",
 		HostType: "host-android-amd64-emu",
 		env: []string{
@@ -1534,10 +1552,10 @@ func init() {
 		Notes: "Runs GOOS=linux but with the Android emulator attached, for running x/mobile host tests.",
 	})
 	addBuilder(BuildConfig{
-		Name:      "linux-amd64-stretch",
-		HostType:  "host-linux-stretch",
-		MaxAtOnce: 1,
-		Notes:     "Debian Stretch",
+		Name:      "linux-amd64-jessie",
+		HostType:  "host-linux-jessie",
+		MaxAtOnce: 5,
+		Notes:     "Debian Jessie. The normal 'linux-amd64' builder is stretch. We use Jessie for our release builds due to https://golang.org/issue/31293",
 		env: []string{
 			"GO_DISABLE_OUTBOUND_NETWORK=1",
 		},
@@ -1603,7 +1621,6 @@ func init() {
 		Name:              "nacl-386",
 		HostType:          "host-nacl-kube",
 		buildsRepo:        onlyGo,
-		tryBot:            explicitTrySet("go"),
 		MaxAtOnce:         2,
 		numTryTestHelpers: 3,
 		env:               []string{"GOOS=nacl", "GOARCH=386", "GOHOSTOS=linux", "GOHOSTARCH=amd64"},
@@ -1625,7 +1642,7 @@ func init() {
 			switch repo {
 			case "go":
 				return true
-			case "mobile", "benchmarks", "debug", "perf", "talks", "tools", "tour", "website":
+			case "mobile", "exp", "benchmarks", "debug", "perf", "talks", "tools", "tour", "website":
 				return false
 			default:
 				return branch == "master" && goBranch == "master"
@@ -1742,8 +1759,7 @@ func init() {
 		HostType:          "host-netbsd-386-8_0",
 		shouldRunDistTest: netBSDDistTestPolicy,
 		MaxAtOnce:         1,
-		// This builder currently hangs in the “../test” phase of all.bash.
-		// (https://golang.org/issue/25206)
+		// This builder currently hangs in the runtime tests; Issue 31726.
 		buildsRepo: disabledBuilder,
 	})
 	addBuilder(BuildConfig{
@@ -1760,8 +1776,9 @@ func init() {
 	addBuilder(BuildConfig{
 		Name:           "plan9-386",
 		HostType:       "host-plan9-386-gce",
-		numTestHelpers: 1,
 		MaxAtOnce:      2,
+		numTestHelpers: 1,
+		tryOnly:        true, // disable it for now; Issue 31261, Issue 29801
 		shouldRunDistTest: func(distTestName string, isTry bool) bool {
 			switch distTestName {
 			case "api",
@@ -1770,6 +1787,7 @@ func init() {
 			}
 			return true
 		},
+		buildsRepo: onlyMaster,
 	})
 	addBuilder(BuildConfig{
 		Name:              "windows-amd64-2008",
@@ -1789,6 +1807,7 @@ func init() {
 	addBuilder(BuildConfig{
 		Name:              "windows-386-2008",
 		HostType:          "host-windows-amd64-2008",
+		buildsRepo:        defaultPlusExp,
 		shouldRunDistTest: fasterTrybots,
 		env:               []string{"GOARCH=386", "GOHOSTARCH=386"},
 		MaxAtOnce:         2,
@@ -1814,6 +1833,7 @@ func init() {
 	addBuilder(BuildConfig{
 		Name:              "windows-amd64-2016",
 		HostType:          "host-windows-amd64-2016",
+		buildsRepo:        defaultPlusExp,
 		shouldRunDistTest: fasterTrybots,
 		env: []string{
 			"GOARCH=amd64",
@@ -1875,8 +1895,8 @@ func init() {
 		numTryTestHelpers: 3,
 	})
 	addBuilder(BuildConfig{
-		Name:              "darwin-386-10_11",
-		HostType:          "host-darwin-10_11",
+		Name:              "darwin-386-10_14",
+		HostType:          "host-darwin-10_14",
 		shouldRunDistTest: macTestPolicy,
 		buildsRepo:        onlyGo,
 		MaxAtOnce:         1,
@@ -1886,29 +1906,26 @@ func init() {
 		Name:              "darwin-amd64-10_12",
 		HostType:          "host-darwin-10_12",
 		shouldRunDistTest: macTestPolicy,
+		buildsRepo:        defaultPlusExp,
 	})
 	addBuilder(BuildConfig{
 		Name:              "darwin-amd64-10_14",
 		HostType:          "host-darwin-10_14",
 		shouldRunDistTest: macTestPolicy,
+		buildsRepo:        defaultPlusExp,
+	})
+	addBuilder(BuildConfig{
+		Name:              "darwin-amd64-nocgo",
+		HostType:          "host-darwin-10_14",
+		MaxAtOnce:         1,
+		shouldRunDistTest: noTestDir,
+		env:               []string{"CGO_ENABLED=0"},
 	})
 	addBuilder(BuildConfig{
 		Name:              "darwin-amd64-race",
 		HostType:          "host-darwin-10_12",
 		shouldRunDistTest: macTestPolicy,
 		buildsRepo:        onlyGo,
-	})
-	addBuilder(BuildConfig{
-		Name:     "darwin-arm-a1428ios",
-		HostType: "host-darwin-amd64-eliasnaur-ios",
-		Notes:    "iPhone 6 (model A1586), via a Mac Mini; owned by elias.naur",
-		env:      []string{"GOARCH=arm"},
-	})
-	addBuilder(BuildConfig{
-		Name:     "darwin-arm64-a1549ios",
-		HostType: "host-darwin-amd64-eliasnaur-ios",
-		Notes:    "iPhone 6 (model A1586), via a Mac Mini; owned by elias.naur",
-		env:      []string{"GOARCH=arm64"},
 	})
 	addBuilder(BuildConfig{
 		Name:     "darwin-arm-mg912baios",
@@ -1929,44 +1946,31 @@ func init() {
 		},
 	})
 	addBuilder(BuildConfig{
-		Name:     "darwin-amd64-wikofever",
-		HostType: "host-darwin-amd64-eliasnaur-android",
-		Notes:    "Same as android-arm*-wikofever but without GOOS set, for running x/mobile tests.",
+		Name:     "darwin-arm64-corellium",
+		HostType: "host-darwin-arm64-corellium-ios",
+		Notes:    "Virtual iPhone SE running on Corellium; owned by zenly",
 		buildsRepo: func(repo, branch, goBranch string) bool {
-			return repo == "mobile" && branch == "master" && goBranch == "master"
-		},
-		env: []string{
-			"CGO_ENABLED=1",
+			return repo == "go" && branch == "master" && goBranch == "master"
 		},
 	})
 	addBuilder(BuildConfig{
-		Name:     "android-arm-wikofever",
-		HostType: "host-darwin-amd64-eliasnaur-android",
-		Notes:    "Android Wiko Fever phone running Android 6.0, via a Mac Mini",
+		Name:     "android-arm64-corellium",
+		HostType: "host-android-arm64-corellium-android",
+		Notes:    "Virtual Android running on Corellium; owned by zenly",
+		buildsRepo: func(repo, branch, goBranch string) bool {
+			return repo == "go" && branch == "master" && goBranch == "master"
+		},
+	})
+	addBuilder(BuildConfig{
+		Name:     "android-arm-corellium",
+		HostType: "host-android-arm64-corellium-android",
+		Notes:    "Virtual Android running on Corellium; owned by zenly",
 		buildsRepo: func(repo, branch, goBranch string) bool {
 			return repo == "go" && branch == "master" && goBranch == "master"
 		},
 		env: []string{
+			"CGO_ENABLED=1",
 			"GOARCH=arm",
-			"GOOS=android",
-			"GOHOSTARCH=amd64",
-			"GOHOSTOS=darwin",
-			"CGO_ENABLED=1",
-		},
-	})
-	addBuilder(BuildConfig{
-		Name:     "android-arm64-wikofever",
-		HostType: "host-darwin-amd64-eliasnaur-android",
-		Notes:    "Android Wiko Fever phone running Android 6.0, via a Mac Mini",
-		buildsRepo: func(repo, branch, goBranch string) bool {
-			return repo == "go" && branch == "master" && goBranch == "master"
-		},
-		env: []string{
-			"GOARCH=arm64",
-			"GOOS=android",
-			"GOHOSTARCH=amd64",
-			"GOHOSTOS=darwin",
-			"CGO_ENABLED=1",
 		},
 	})
 	addBuilder(BuildConfig{
@@ -1989,11 +1993,16 @@ func init() {
 		},
 	})
 	addBuilder(BuildConfig{
-		Name:     "android-amd64-emu",
-		HostType: "host-android-amd64-emu",
-		Notes:    "Android emulator on GCE",
+		Name:              "android-amd64-emu",
+		HostType:          "host-android-amd64-emu",
+		Notes:             "Android emulator on GCE",
+		numTryTestHelpers: 3,
 		tryBot: func(repo, branch, goBranch string) bool {
-			return repo == "mobile" && atLeastGo1(branch, 13) && atLeastGo1(goBranch, 13)
+			switch repo {
+			case "go", "mobile", "sys", "net", "tools", "crypto", "sync", "text", "time":
+				return atLeastGo1(branch, 13) && atLeastGo1(goBranch, 13)
+			}
+			return false
 		},
 		buildsRepo: func(repo, branch, goBranch string) bool {
 			switch repo {
@@ -2009,11 +2018,6 @@ func init() {
 			"GOHOSTOS=linux",
 			"CGO_ENABLED=1",
 		},
-	})
-	addBuilder(BuildConfig{
-		Name:     "solaris-amd64-oracledev",
-		HostType: "host-solaris-oracle-shawn",
-		Notes:    "Oracle Solaris development version",
 	})
 	addBuilder(BuildConfig{
 		Name:     "solaris-amd64-oraclerel",
@@ -2117,20 +2121,43 @@ func init() {
 	addBuilder(BuildConfig{
 		Name:              "plan9-arm",
 		HostType:          "host-plan9-arm-0intro",
-		shouldRunDistTest: noTestDir,
 		SkipSnapshot:      true,
+		shouldRunDistTest: noTestDir,
+		buildsRepo:        onlyMaster,
 	})
 	addBuilder(BuildConfig{
-		Name:         "nacl-arm",
-		HostType:     "host-nacl-arm-davecheney",
-		buildsRepo:   onlyGo,
+		Name:         "plan9-amd64-9front",
+		HostType:     "host-plan9-amd64-0intro",
 		SkipSnapshot: true,
+		shouldRunDistTest: func(distTestName string, isTry bool) bool {
+			if !noTestDir(distTestName, isTry) {
+				return false
+			}
+			switch distTestName {
+			case "api",
+				"go_test:cmd/go": // takes over 20 minutes without working SMP
+				return false
+			}
+			return true
+		},
+		buildsRepo: onlyMaster,
 	})
 	addBuilder(BuildConfig{
-		Name:              "plan9-amd64-9front",
-		HostType:          "host-plan9-amd64-0intro",
-		shouldRunDistTest: noTestDir,
-		SkipSnapshot:      true,
+		Name:         "plan9-386-0intro",
+		HostType:     "host-plan9-386-0intro",
+		SkipSnapshot: true,
+		shouldRunDistTest: func(distTestName string, isTry bool) bool {
+			if !noTestDir(distTestName, isTry) {
+				return false
+			}
+			switch distTestName {
+			case "api",
+				"go_test:cmd/go": // takes over 20 minutes without working SMP
+				return false
+			}
+			return true
+		},
+		buildsRepo: onlyMaster,
 	})
 	addBuilder(BuildConfig{
 		Name:             "aix-ppc64",
@@ -2138,6 +2165,15 @@ func init() {
 		MinimumGoVersion: types.MajorMinor{1, 12},
 		env: []string{
 			"PATH=/opt/freeware/bin:/usr/bin:/etc:/usr/sbin:/usr/ucb:/usr/bin/X11:/sbin:/usr/java7_64/jre/bin:/usr/java7_64/bin",
+		},
+		buildsRepo: func(repo, branch, goBranch string) bool {
+			switch repo {
+			case "net":
+				// The x/net package wasn't working in Go 1.12; AIX folk plan to have
+				// it ready by Go 1.13. See https://golang.org/issue/31564#issuecomment-484786144
+				return atLeastGo1(branch, 13) && atLeastGo1(goBranch, 13)
+			}
+			return atLeastGo1(branch, 12) && atLeastGo1(goBranch, 12)
 		},
 	})
 
@@ -2227,6 +2263,9 @@ func atLeastGo1(branch string, min int) bool {
 
 // onlyGo is a common buildsRepo policy value that only builds the main "go" repo.
 func onlyGo(repo, branch, goBranch string) bool { return repo == "go" }
+
+// onlyMaster is a common buildsRepo policy value that only builds things on the master branch.
+func onlyMaster(repo, branch, goBranch string) bool { return branch == "master" && goBranch == "master" }
 
 // disabledBuilder is a buildsRepo policy function that always return false.
 func disabledBuilder(repo, branch, goBranch string) bool { return false }

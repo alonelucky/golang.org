@@ -41,28 +41,43 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/build/buildlet"
 	"golang.org/x/build/dashboard"
 	"golang.org/x/build/revdial"
+	revdialv2 "golang.org/x/build/revdial/v2"
 	"golang.org/x/build/types"
 )
 
 const minBuildletVersion = 1
 
-var reversePool = new(reverseBuildletPool)
+var reversePool = &reverseBuildletPool{
+	oldInUse: make(map[*buildlet.Client]bool),
+}
+
+const maxOldRevdialUsers = 10
 
 type token struct{}
 
 type reverseBuildletPool struct {
-	mu sync.Mutex // guards all fields, including fields of *reverseBuildlet
+	// mu guards all 4 fields below and also fields of
+	// *reverseBuildlet in buildlets
+	mu sync.Mutex
+
+	// buildlets are the currently connected buildlets.
 	// TODO: switch to a map[hostType][]buildlets or map of set.
 	buildlets []*reverseBuildlet
-	wakeChan  map[string]chan token // hostType => best-effort wake-up chan when buildlet free
-	waiters   map[string]int        // hostType => number waiters blocked in GetBuildlet
+
+	wakeChan map[string]chan token // hostType => best-effort wake-up chan when buildlet free
+
+	waiters map[string]int // hostType => number waiters blocked in GetBuildlet
+
+	// oldInUse tracks which buildlets with the old revdial code are currently in use.
+	// These are a liability due to runaway memory issues (Issue 31639) so
+	// we bound how many can be running at once. Fortunately there aren't many left.
+	oldInUse map[*buildlet.Client]bool
 }
 
 func (p *reverseBuildletPool) ServeReverseStatusJSON(w http.ResponseWriter, r *http.Request) {
@@ -126,9 +141,15 @@ func (p *reverseBuildletPool) tryToGrab(hostType string) (bc *buildlet.Client, b
 			busy++
 			continue
 		}
+		if b.isOldRevDial && len(p.oldInUse) >= maxOldRevdialUsers {
+			continue
+		}
 		// Found an unused match.
 		b.inUse = true
 		b.inUseTime = time.Now()
+		if b.isOldRevDial {
+			p.oldInUse[b.client] = true
+		}
 		return b.client, 0
 	}
 	return nil, busy
@@ -162,6 +183,7 @@ func (p *reverseBuildletPool) noteBuildletAvailable(hostType string) {
 func (p *reverseBuildletPool) nukeBuildlet(victim *buildlet.Client) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	delete(p.oldInUse, victim)
 	for i, rb := range p.buildlets {
 		if rb.client == victim {
 			defer rb.conn.Close()
@@ -345,10 +367,12 @@ func (p *reverseBuildletPool) WriteHTMLStatus(w io.Writer) {
 	p.mu.Lock()
 	buildlets := append([]*reverseBuildlet(nil), p.buildlets...)
 	sort.Sort(byTypeThenHostname(buildlets))
+	numInUse := 0
 	for _, b := range buildlets {
 		machStatus := "<i>idle</i>"
 		if b.inUse {
 			machStatus = "working"
+			numInUse++
 		}
 		fmt.Fprintf(&buf, "<li>%s (%s) version %s, %s: connected %s, %s for %s</li>\n",
 			b.hostname,
@@ -363,6 +387,8 @@ func (p *reverseBuildletPool) WriteHTMLStatus(w io.Writer) {
 			inUse[b.hostType]++
 		}
 	}
+	numOldInUse := len(p.oldInUse)
+	numConnected := len(buildlets)
 	p.mu.Unlock()
 
 	var typs []string
@@ -371,7 +397,13 @@ func (p *reverseBuildletPool) WriteHTMLStatus(w io.Writer) {
 	}
 	sort.Strings(typs)
 
-	io.WriteString(w, "<b>Reverse pool summary</b> (in use / total)<ul>")
+	io.WriteString(w, "<b>Reverse pool stats</b><ul>")
+	fmt.Fprintf(w, "<li>Buildlets connected: %d</li>\n", numConnected)
+	fmt.Fprintf(w, "<li>Buildlets in use: %d</li>\n", numInUse)
+	fmt.Fprintf(w, "<li>Old revdial buildlets in use: %d</li>\n", numOldInUse)
+	io.WriteString(w, "</ul>")
+
+	io.WriteString(w, "<b>Reverse pool by host type</b> (in use / total)<ul>")
 	if len(typs) == 0 {
 		io.WriteString(w, "<li>no connections</li>")
 	}
@@ -450,7 +482,8 @@ type reverseBuildlet struct {
 	// It doesn't have to be a complete DNS name.
 	hostname string
 	// version is the reverse buildlet's version.
-	version string
+	version      string
+	isOldRevDial bool // version 22 or under: using the v1 revdial package (Issue 31639)
 
 	// sessRand is the unique random number for every unique buildlet session.
 	sessRand string
@@ -483,6 +516,19 @@ func handleReverse(w http.ResponseWriter, r *http.Request) {
 	hostType := r.Header.Get("X-Go-Host-Type")
 	modes := r.Header["X-Go-Builder-Type"] // old way
 	gobuildkeys := r.Header["X-Go-Builder-Key"]
+	buildletVersion := r.Header.Get("X-Go-Builder-Version")
+	revDialVersion := r.Header.Get("X-Revdial-Version")
+
+	switch revDialVersion {
+	case "":
+		// Old.
+		revDialVersion = "1"
+	case "2":
+		// Current.
+	default:
+		http.Error(w, "unknown revdial version", http.StatusBadRequest)
+		return
+	}
 
 	// Convert the new argument style (X-Go-Host-Type) into the
 	// old way, to minimize changes in the rest of this code.
@@ -506,20 +552,6 @@ func handleReverse(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Silently pretend that "gomacmini-*.local" doesn't want to do darwin-amd64-10_10 and
-	// darwin-386-10_10 anymore.
-	// TODO(bradfitz): remove this hack after we reconfigure those machines.
-	if strings.HasPrefix(hostname, "gomacmini-") && strings.HasSuffix(hostname, ".local") {
-		var filtered []string
-		for _, m := range modes {
-			if m == "darwin-amd64-10_10" || m == "darwin-386-10_10" {
-				continue
-			}
-			filtered = append(filtered, m)
-		}
-		modes = filtered
-	}
-
 	// For older builders using the buildlet's -reverse flag only,
 	// collapse their builder modes down into a singular hostType.
 	legacyNote := ""
@@ -534,21 +566,40 @@ func handleReverse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	revDialer := revdial.NewDialer(bufrw, conn)
-	log.Printf("Registering reverse buildlet %q (%s) for host type %v%s",
-		hostname, r.RemoteAddr, hostType, legacyNote)
+	if err := (&http.Response{StatusCode: http.StatusSwitchingProtocols, Proto: "HTTP/1.1"}).Write(conn); err != nil {
+		log.Printf("error writing upgrade response to reverse buildlet %s (%s) at %s: %v", hostname, hostType, r.RemoteAddr, err)
+		conn.Close()
+		return
+	}
 
-	(&http.Response{StatusCode: http.StatusSwitchingProtocols, Proto: "HTTP/1.1"}).Write(conn)
+	log.Printf("Registering reverse buildlet %q (%s) for host type %v %s; buildletVersion=%v; revDialVersion=%v",
+		hostname, r.RemoteAddr, hostType, legacyNote, buildletVersion, revDialVersion)
+
+	var dialer func(context.Context) (net.Conn, error)
+	var revDialerDone <-chan struct{}
+	switch revDialVersion {
+	case "1":
+		revDialer := revdial.NewDialer(bufrw, conn)
+		revDialerDone = revDialer.Done()
+		dialer = func(ctx context.Context) (net.Conn, error) {
+			// ignoring context.
+			return revDialer.Dial()
+		}
+	case "2":
+		revDialer := revdialv2.NewDialer(conn, "/revdial")
+		revDialerDone = revDialer.Done()
+		dialer = revDialer.Dial
+	}
 
 	client := buildlet.NewClient(hostname, buildlet.NoKeyPair)
 	client.SetHTTPClient(&http.Client{
 		Transport: &http.Transport{
-			Dial: func(network, addr string) (net.Conn, error) {
-				return revDialer.Dial()
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer(ctx)
 			},
 		},
 	})
-	client.SetDialer(revDialer.Dial)
+	client.SetDialer(dialer)
 	client.SetDescription(fmt.Sprintf("reverse peer %s/%s for host type %v", hostname, r.RemoteAddr, hostType))
 
 	var isDead struct {
@@ -567,7 +618,7 @@ func handleReverse(w http.ResponseWriter, r *http.Request) {
 	// conn) detects that the remote went away, close the buildlet
 	// client proactively show
 	go func() {
-		<-revDialer.Done()
+		<-revDialerDone
 		isDead.Lock()
 		defer isDead.Unlock()
 		if !isDead.v {
@@ -591,13 +642,14 @@ func handleReverse(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	b := &reverseBuildlet{
-		hostname:  hostname,
-		version:   r.Header.Get("X-Go-Builder-Version"),
-		hostType:  hostType,
-		client:    client,
-		conn:      conn,
-		inUseTime: now,
-		regTime:   now,
+		hostname:     hostname,
+		version:      buildletVersion,
+		isOldRevDial: status.Version < 23,
+		hostType:     hostType,
+		client:       client,
+		conn:         conn,
+		inUseTime:    now,
+		regTime:      now,
 	}
 	reversePool.addBuildlet(b)
 	registerBuildlet(modes) // testing only

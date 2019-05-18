@@ -317,6 +317,7 @@ var goGitHubProjects = []string{
 	"golang/image",
 	"golang/lint",
 	"golang/mobile",
+	"golang/mod",
 	"golang/net",
 	"golang/oauth2",
 	"golang/perf",
@@ -337,6 +338,7 @@ var goGitHubProjects = []string{
 	"golang/vgo",
 	"golang/website",
 	"golang/xerrors",
+	"protocolbuffers/protobuf-go",
 }
 
 func setGoConfig() {

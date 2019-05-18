@@ -83,6 +83,9 @@ func envInit() (err error) {
 	// Setup the cross-compiler environments.
 	if ndkRoot, err := ndkRoot(); err == nil {
 		androidEnv = make(map[string][]string)
+		if buildAndroidAPI < minAndroidAPI {
+			return fmt.Errorf("gomobile requires Android API level >= %d", minAndroidAPI)
+		}
 		for arch, toolchain := range ndk {
 			clang := toolchain.Path(ndkRoot, "clang")
 			clangpp := toolchain.Path(ndkRoot, "clang++")
@@ -161,16 +164,25 @@ func ndkRoot() (string, error) {
 	if buildN {
 		return "$NDK_PATH", nil
 	}
+
 	androidHome := os.Getenv("ANDROID_HOME")
-	if androidHome == "" {
-		return "", errors.New("The Android SDK was not found. Please set ANDROID_HOME to the root of the Android SDK.")
+	if androidHome != "" {
+		ndkRoot := filepath.Join(androidHome, "ndk-bundle")
+		_, err := os.Stat(ndkRoot)
+		if err == nil {
+			return ndkRoot, nil
+		}
 	}
-	ndkRoot := filepath.Join(androidHome, "ndk-bundle")
-	_, err := os.Stat(ndkRoot)
-	if err != nil {
-		return "", fmt.Errorf("The NDK was not found in $ANDROID_HOME/ndk-bundle (%q). Install the NDK with `sdkmanager 'ndk-bundle'`", ndkRoot)
+
+	ndkRoot := os.Getenv("ANDROID_NDK_HOME")
+	if ndkRoot != "" {
+		_, err := os.Stat(ndkRoot)
+		if err == nil {
+			return ndkRoot, nil
+		}
 	}
-	return ndkRoot, nil
+
+	return "", fmt.Errorf("no Android NDK found in $ANDROID_HOME/ndk-bundle nor in $ANDROID_NDK_HOME")
 }
 
 func envClang(sdkName string) (clang, cflags string, err error) {
@@ -274,15 +286,23 @@ func archNDK() string {
 type ndkToolchain struct {
 	arch        string
 	abi         string
+	minAPI      int
 	toolPrefix  string
 	clangPrefix string
+}
+
+func (tc *ndkToolchain) ClangPrefix() string {
+	if buildAndroidAPI < tc.minAPI {
+		return fmt.Sprintf("%s%d", tc.clangPrefix, tc.minAPI)
+	}
+	return fmt.Sprintf("%s%d", tc.clangPrefix, buildAndroidAPI)
 }
 
 func (tc *ndkToolchain) Path(ndkRoot, toolName string) string {
 	var pref string
 	switch toolName {
 	case "clang", "clang++":
-		pref = tc.clangPrefix
+		pref = tc.ClangPrefix()
 	default:
 		pref = tc.toolPrefix
 	}
@@ -303,27 +323,31 @@ var ndk = ndkConfig{
 	"arm": {
 		arch:        "arm",
 		abi:         "armeabi-v7a",
+		minAPI:      16,
 		toolPrefix:  "arm-linux-androideabi",
-		clangPrefix: "armv7a-linux-androideabi16",
+		clangPrefix: "armv7a-linux-androideabi",
 	},
 	"arm64": {
 		arch:        "arm64",
 		abi:         "arm64-v8a",
+		minAPI:      21,
 		toolPrefix:  "aarch64-linux-android",
-		clangPrefix: "aarch64-linux-android21",
+		clangPrefix: "aarch64-linux-android",
 	},
 
 	"386": {
 		arch:        "x86",
 		abi:         "x86",
+		minAPI:      16,
 		toolPrefix:  "i686-linux-android",
-		clangPrefix: "i686-linux-android16",
+		clangPrefix: "i686-linux-android",
 	},
 	"amd64": {
 		arch:        "x86_64",
 		abi:         "x86_64",
+		minAPI:      21,
 		toolPrefix:  "x86_64-linux-android",
-		clangPrefix: "x86_64-linux-android21",
+		clangPrefix: "x86_64-linux-android",
 	},
 }
 

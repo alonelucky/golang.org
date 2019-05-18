@@ -123,7 +123,7 @@ type Environment struct {
 	SnapBucket string
 
 	// MaxBuilds is the maximum number of concurrent builds that
-	// can run. Zero means unlimit. This is typically only used
+	// can run. Zero means unlimited. This is typically only used
 	// in a development or staging environment.
 	MaxBuilds int
 

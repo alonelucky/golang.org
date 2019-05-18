@@ -74,7 +74,10 @@ var (
 //   17: make macstadium halts use sudo
 //   18: set TMPDIR and GOCACHE
 //   21: GO_BUILDER_SET_GOPROXY=coordinator support
-const buildletVersion = 21
+//   22: TrimSpace the reverse buildlet's gobuildkey contents
+//   23: revdial v2
+//   24: removeAllIncludingReadonly
+const buildletVersion = 24
 
 func defaultListenAddr() string {
 	if runtime.GOOS == "darwin" {
@@ -927,18 +930,6 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 
 	env := append(baseEnv(goarch), postEnv...)
 
-	// Setup an localhost HTTP server to proxy module cache, if requested by environment.
-	if goproxyHandler != nil && getEnv(postEnv, "GO_BUILDER_SET_GOPROXY") == "coordinator" {
-		ln, err := net.Listen("tcp", "localhost:0")
-		if err != nil {
-			http.Error(w, "failed to listen on localhost for GOPROXY=coordinator: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer ln.Close()
-		srv := &http.Server{Handler: goproxyHandler}
-		go srv.Serve(ln)
-		env = append(env, fmt.Sprintf("GOPROXY=http://localhost:%d", ln.Addr().(*net.TCPAddr).Port))
-	}
 	if v := processTmpDirEnv; v != "" {
 		env = append(env, "TMPDIR="+v)
 	}
@@ -953,7 +944,13 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	env = setPathEnv(env, r.PostForm["path"], *workDir)
 
-	cmd := exec.Command(absCmd, r.PostForm["cmdArg"]...)
+	var cmd *exec.Cmd
+	if needsBashWrapper(absCmd) {
+		cmd = exec.Command("bash", absCmd)
+	} else {
+		cmd = exec.Command(absCmd)
+	}
+	cmd.Args = append(cmd.Args, r.PostForm["cmdArg"]...)
 	cmd.Dir = dir
 	cmdOutput := flushWriter{w}
 	cmd.Stdout = cmdOutput
@@ -994,6 +991,17 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set(hdrProcessState, state)
 	log.Printf("[%p] Run = %s, after %v", cmd, state, time.Since(t0))
+}
+
+// needsBashWrappers reports whether the given command needs to
+// run through bash.
+func needsBashWrapper(cmd string) bool {
+	if !strings.HasSuffix(cmd, ".bash") {
+		return false
+	}
+	// The mobile platforms can't execute shell scripts directly.
+	ismobile := runtime.GOOS == "android" || runtime.GOOS == "darwin" && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64")
+	return ismobile
 }
 
 // pathNotExist reports whether path does not exist.
@@ -1253,7 +1261,7 @@ func handleRemoveAll(w http.ResponseWriter, r *http.Request) {
 	for _, p := range paths {
 		log.Printf("Removing %s", p)
 		fullDir := filepath.Join(*workDir, filepath.FromSlash(p))
-		err := os.RemoveAll(fullDir)
+		err := removeAllIncludingReadonly(fullDir)
 		if p == "." && err != nil {
 			// If workDir is a mountpoint and/or contains a binary
 			// using it, we can get a "Device or resource busy" error.
@@ -1655,10 +1663,7 @@ func configureMacStadium() {
 	// TODO: setup RAM disk for tmp and set *workDir
 
 	disableMacScreensaver()
-
-	// Enable developer mode for runtime tests. (Issue 31123)
-	// Best effort; ignore any error.
-	exec.Command("/usr/sbin/DevToolsSecurity", "-enable").Run()
+	enableMacDeveloperMode()
 
 	version, err := exec.Command("sw_vers", "-productVersion").Output()
 	if err != nil {
@@ -1708,6 +1713,30 @@ func disableMacScreensaver() {
 	if err != nil {
 		log.Printf("disabling screensaver: %v", err)
 	}
+}
+
+// enableMacDeveloperMode enables developer mode on macOS for the
+// runtime tests. (Issue 31123)
+//
+// It is best effort; errors are logged but otherwise ignored.
+func enableMacDeveloperMode() {
+	// Macs are configured with password-less sudo. Without sudo we get prompts
+	// that "SampleTools wants to make changes" that block the buildlet from starting.
+	// But oddly, not via gomote. Only during startup. The environment must be different
+	// enough that in one case macOS asks for permission (because it can use the GUI?)
+	// and in the gomote case (where the environment is largley scrubbed) it can't do
+	// the GUI dialog somehow and must just try to do it anyway and finds that passwordless
+	// sudo works. But using sudo seems to make it always work.
+	// For extra paranoia, use a context to not block start-up.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "/usr/bin/sudo", "/usr/sbin/DevToolsSecurity", "-enable").CombinedOutput()
+	if err != nil {
+		log.Printf("Error enabling developer mode: %v, %s", err, out)
+		return
+	}
+	log.Printf("DevToolsSecurity: %s", out)
 }
 
 func vmwareGetInfo(key string) string {
@@ -1833,6 +1862,30 @@ func removeAllAndMkdir(dir string) {
 	if err := os.Mkdir(dir, 0755); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// removeAllIncludingReadonly is like os.RemoveAll except that it'll
+// also try to change permissions to work around permission errors
+// when deleting.
+func removeAllIncludingReadonly(dir string) error {
+	err := os.RemoveAll(dir)
+	if err == nil || !os.IsPermission(err) ||
+		runtime.GOOS == "windows" || // different filesystem permission model; also our windows builders our emphermal single-use VMs anyway
+		runtime.GOOS == "plan9" { // untested, different enough to conservatively skip code below
+		return err
+	}
+	// Make a best effort (ignoring errors) attempt to make all
+	// files and directories writable before we try to delete them
+	// all again.
+	filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
+		const ownerWritable = 0200
+		if err != nil || fi.Mode().Perm()&ownerWritable != 0 {
+			return nil
+		}
+		os.Chmod(path, fi.Mode().Perm()|ownerWritable)
+		return nil
+	})
+	return os.RemoveAll(dir)
 }
 
 var (

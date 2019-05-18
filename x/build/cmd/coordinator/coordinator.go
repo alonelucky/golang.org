@@ -60,6 +60,7 @@ import (
 	"golang.org/x/build/internal/sourcecache"
 	"golang.org/x/build/livelog"
 	"golang.org/x/build/maintner/maintnerd/apipb"
+	revdialv2 "golang.org/x/build/revdial/v2"
 	"golang.org/x/build/types"
 	"golang.org/x/crypto/acme/autocert"
 	perfstorage "golang.org/x/perf/storage"
@@ -67,8 +68,6 @@ import (
 )
 
 const (
-	subrepoPrefix = "golang.org/x/"
-
 	// eventDone is a build event name meaning the build was
 	// completed (either successfully or with remote errors).
 	// Notably, it is NOT included for network/communication
@@ -222,10 +221,6 @@ func (httpRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		requireBuildletProxyAuth(http.HandlerFunc(proxyBuildletHTTP)).ServeHTTP(w, r)
 		return
 	}
-	if r.Header.Get("X-Proxy-Service") == "module-cache" {
-		proxyModuleCache(w, r)
-		return
-	}
 	http.DefaultServeMux.ServeHTTP(w, r)
 }
 
@@ -305,6 +300,7 @@ func main() {
 	http.HandleFunc("/builders", handleBuilders)
 	http.HandleFunc("/temporarylogs", handleLogs)
 	http.HandleFunc("/reverse", handleReverse)
+	http.Handle("/revdial", revdialv2.ConnHandler())
 	http.HandleFunc("/style.css", handleStyleCSS)
 	http.HandleFunc("/try", serveTryStatus(false))
 	http.HandleFunc("/try.json", serveTryStatus(true))
@@ -341,6 +337,7 @@ func main() {
 			dashboard.Builders = stagingClusterBuilders()
 		}
 
+		go listenAndServeInternalModuleProxy()
 		go findWorkLoop(workc)
 		go findTryWorkLoop()
 		go reportMetrics(context.Background())
@@ -467,14 +464,14 @@ func mayBuildRev(rev buildgo.BuilderRev) bool {
 	if isBuilding(rev) {
 		return false
 	}
-	if buildEnv.MaxBuilds > 0 && numCurrentBuilds() >= buildEnv.MaxBuilds {
-		return false
-	}
 	buildConf, ok := dashboard.Builders[rev.Name]
 	if !ok {
 		if logUnknownBuilder.Allow() {
 			log.Printf("unknown builder %q", rev.Name)
 		}
+		return false
+	}
+	if buildEnv.MaxBuilds > 0 && numCurrentBuilds() >= buildEnv.MaxBuilds {
 		return false
 	}
 	if buildConf.MaxAtOnce > 0 && numCurrentBuildsOfType(rev.Name) >= buildConf.MaxAtOnce {
@@ -1340,6 +1337,8 @@ func (ts *trySet) noteBuildComplete(bs *buildStatus) {
 	benchResults := append([]string(nil), ts.benchResults...)
 	ts.mu.Unlock()
 
+	const failureFooter = "Consult https://build.golang.org/ to see whether they are new failures. Keep in mind that TryBots currently test *exactly* your git commit, without rebasing. If your commit's git parent is old, the failure might've already been fixed."
+
 	if !succeeded {
 		s1 := sha1.New()
 		io.WriteString(s1, buildLog)
@@ -1367,7 +1366,7 @@ func (ts *trySet) noteBuildComplete(bs *buildStatus) {
 					"Build is still in progress...\n"+
 						"This change failed on %s:\n"+
 						"See %s\n\n"+
-						"Consult https://build.golang.org/ to see whether it's a new failure. Other builds still in progress; subsequent failure notices suppressed until final report.",
+						"Other builds still in progress; subsequent failure notices suppressed until final report. "+failureFooter,
 					bs.NameAndBranch(), failLogURL),
 			}); err != nil {
 				log.Printf("Failed to call Gerrit: %v", err)
@@ -1382,7 +1381,7 @@ func (ts *trySet) noteBuildComplete(bs *buildStatus) {
 			ts.mu.Lock()
 			errMsg := ts.errMsg.String()
 			ts.mu.Unlock()
-			score, msg = -1, fmt.Sprintf("%d of %d TryBots failed:\n%s\nConsult https://build.golang.org/ to see whether they are new failures.",
+			score, msg = -1, fmt.Sprintf("%d of %d TryBots failed:\n%s\n"+failureFooter,
 				numFail, len(ts.builds), errMsg)
 		}
 		if len(benchResults) > 0 {
@@ -1800,6 +1799,18 @@ func (st *buildStatus) build() error {
 	} else if err != nil {
 		doneMsg = "comm error: " + err.Error()
 	}
+	// If a build fails multiple times due to communication
+	// problems with the buildlet, assume something's wrong with
+	// the buildlet or machine and fail the build, rather than
+	// looping forever. This promotes the err (communication
+	// error) to a remoteErr (an error that occurred remotely and
+	// is terminal).
+	if rerr := st.repeatedCommunicationError(err); rerr != nil {
+		remoteErr = rerr
+		err = nil
+		doneMsg = "communication error to buildlet (promoted to terminal error): " + rerr.Error()
+		fmt.Fprintf(st, "\n%s\n", doneMsg)
+	}
 	if err != nil {
 		// Return the error *before* we create the magic
 		// "done" event. (which the try coordinator looks for)
@@ -1950,6 +1961,10 @@ func (st *buildStatus) runAllSharded() (remoteErr, err error) {
 		remoteErr, err = st.runTests(st.getHelpers())
 	}
 
+	if err == errBuildletsGone {
+		// Don't wrap this error. TODO: use xerrors.
+		return nil, errBuildletsGone
+	}
 	if err != nil {
 		return nil, fmt.Errorf("runTests: %v", err)
 	}
@@ -2347,7 +2362,7 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 	// findDeps uses 'go list' on the checked out repo to find its
 	// dependencies, and adds any not-yet-fetched deps to toFetched.
 	findDeps := func(repo string) (rErr, err error) {
-		repoPath := subrepoPrefix + repo
+		repoPath := importPathOfRepo(repo)
 		var buf bytes.Buffer
 		rErr, err = st.bc.Exec(path.Join("go", "bin", "go"), buildlet.ExecOpts{
 			Output:   &buf,
@@ -2363,10 +2378,10 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 			return rErr, nil
 		}
 		for _, p := range strings.Fields(buf.String()) {
-			if !strings.HasPrefix(p, subrepoPrefix) || strings.HasPrefix(p, repoPath) {
+			if !strings.HasPrefix(p, "golang.org/x/") || strings.HasPrefix(p, repoPath) {
 				continue
 			}
-			repo = strings.TrimPrefix(p, subrepoPrefix)
+			repo = strings.TrimPrefix(p, "golang.org/x/")
 			if i := strings.Index(repo, "/"); i >= 0 {
 				repo = repo[:i]
 			}
@@ -2428,7 +2443,7 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 	if st.conf.IsRace() {
 		args = append(args, "-race")
 	}
-	args = append(args, subrepoPrefix+st.SubName+"/...")
+	args = append(args, importPathOfRepo(st.SubName)+"/...")
 
 	return st.bc.Exec(path.Join("go", "bin", "go"), buildlet.ExecOpts{
 		Debug:    true, // make buildlet print extra debug in output for failures
@@ -2443,16 +2458,13 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 // moduleProxy returns the GOPROXY environment value to use for module-enabled
 // tests.
 //
-// We go through a GCP-project-internal module proxy ("GOPROXY") to
-// eliminate load on the origin servers. Our builder VMs are ephemeral
-// and only run for the duration of one build. They also often don't
-// have all the VCS tools installed (or even available: there is no
-// git for plan9).
+// We go through an internal (10.0.0.0/8) proxy that then hits
+// https://proxy.golang.org/ so we're still able to firewall
+// non-internal outbound connections on builder nodes.
 //
-// moduleProxy in prod mode (when running on GKE) returns an http
+// This moduleProxy func in prod mode (when running on GKE) returns an http
 // URL to the current GKE pod's IP with a Kubernetes NodePort service
-// port that forwards to the internal Athens module proxy cache
-// service we run on GKE.
+// port that forwards back to the coordinator's 8123. See comment below.
 //
 // In localhost dev mode it just returns the value of GOPROXY.
 func moduleProxy() string {
@@ -2462,15 +2474,15 @@ func moduleProxy() string {
 		return os.Getenv("GOPROXY")
 	}
 	// We run a NodePort service on each GKE node
-	// (cmd/coordinator/module-proxy-service.yaml) on port 30156
-	// that maps to the Athens service. We could round robin over
-	// all the GKE nodes' IPs if we wanted, but the coordinator is
-	// running on GKE so our node by definition is up, so just use it.
-	// It won't be much traffic.
+	// (cmd/coordinator/module-proxy-service.yaml) on port 30157
+	// that maps back the coordinator's port 8123. (We could round
+	// robin over all the GKE nodes' IPs if we wanted, but the
+	// coordinator is running on GKE so our node by definition is
+	// up, so just use it. It won't be much traffic.)
 	// TODO: migrate to a GKE internal load balancer with an internal static IP
 	// once we migrate symbolic-datum-552 off a Legacy VPC network to the modern
 	// scheme that supports internal static IPs.
-	return "http://" + gkeNodeIP + ":30156"
+	return "http://" + gkeNodeIP + ":30157"
 }
 
 // affectedPkgs returns the name of every package affected by this commit.
@@ -2495,6 +2507,8 @@ func (ts *trySet) affectedPkgs() (pkgs []string) {
 	*/
 	return
 }
+
+var errBuildletsGone = errors.New("runTests: dist test failed: all buildlets had network errors or timeouts, yet tests remain")
 
 // runTests is only called for builders which support a split make/run
 // (should be everything, at least soon). Currently (2015-05-27) iOS
@@ -2630,7 +2644,7 @@ func (st *buildStatus) runTests(helpers <-chan *buildlet.Client) (remoteErr, err
 				st.LogEventTime("still_waiting_on_test", ti.name)
 			case <-buildletsGone:
 				set.cancelAll()
-				return nil, fmt.Errorf("dist test failed: all buildlets had network errors or timeouts, yet tests remain")
+				return nil, errBuildletsGone
 			}
 		}
 
@@ -3289,6 +3303,26 @@ func (st *buildStatus) Write(p []byte) (n int, err error) {
 	return st.output.Write(p)
 }
 
+// repeatedCommunicationError takes a buildlet execution error (a
+// network/communication error, as opposed to a remote execution that
+// ran and had a non-zero exit status and we heard about) and
+// conditionally promotes it to a terminal error. If this returns a
+// non-nil value, the execErr should be considered terminal with the
+// returned error.
+func (st *buildStatus) repeatedCommunicationError(execErr error) error {
+	if execErr == nil {
+		return nil
+	}
+	// For now, only do this for plan9, which is flaky (Issue 31261)
+	if strings.HasPrefix(st.Name, "plan9-") && execErr == errBuildletsGone {
+		// TODO: give it two tries at least later (store state
+		// somewhere; global map?). But for now we're going to
+		// only give it one try.
+		return fmt.Errorf("network error promoted to terminal error: %v", execErr)
+	}
+	return nil
+}
+
 func useGitMirror() bool {
 	return *mode != "dev"
 }
@@ -3352,4 +3386,19 @@ func randHex(n int) string {
 		log.Fatalf("randHex: %v", err)
 	}
 	return fmt.Sprintf("%x", buf)[:n]
+}
+
+// importPathOfRepo returns the Go import path corresponding to the
+// root of the given repo (Gerrit project). Because it's a Go import
+// path, it always has forward slashes and no trailing slash.
+//
+// For example:
+//   "net"    -> "golang.org/x/net"
+//   "crypto" -> "golang.org/x/crypto"
+//   "dl"     -> "golang.org/dl"
+func importPathOfRepo(repo string) string {
+	if repo == "dl" {
+		return "golang.org/dl"
+	}
+	return "golang.org/x/" + repo
 }

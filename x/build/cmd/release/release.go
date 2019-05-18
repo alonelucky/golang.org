@@ -72,13 +72,13 @@ func main() {
 	}
 
 	if (*rev == "" && *tarball == "") || (*rev != "" && *tarball != "") {
-		log.Fatal("must specify one of -rev and -tarball")
-	}
-	if *toolsRev == "" {
-		log.Fatal("must specify -tools flag")
+		log.Fatal("must specify one of -rev or -tarball")
 	}
 	if *version == "" {
-		log.Fatal("must specify -version flag")
+		log.Fatal(`must specify -version flag (such as "go1.12" or "go1.13beta1")`)
+	}
+	if *toolsRev == "" && (versionIncludesGodoc(*version) || versionIncludesTour(*version)) {
+		log.Fatal("must specify -tools flag")
 	}
 
 	coordClient = coordinatorClient()
@@ -184,7 +184,7 @@ var builds = []*Build{
 		OS:      "linux",
 		Arch:    "amd64",
 		Race:    true,
-		Builder: "linux-amd64",
+		Builder: "linux-amd64-jessie", // using Jessie for at least [Go 1.11, Go 1.13] due to golang.org/issue/31336
 	},
 	{
 		OS:      "linux",
@@ -317,6 +317,9 @@ func (b *Build) make() error {
 		if r.repo == "tour" && !versionIncludesTour(*version) {
 			continue
 		}
+		if (r.repo == "net" || r.repo == "tools") && !versionIncludesGodoc(*version) {
+			continue
+		}
 		dir := goPath + "/src/golang.org/x/" + r.repo
 		tar := "https://go.googlesource.com/" + r.repo + "/+archive/" + r.rev + ".tar.gz"
 		if err := client.PutTarFromURL(tar, dir); err != nil {
@@ -401,6 +404,10 @@ func (b *Build) make() error {
 		return fmt.Errorf("Build failed: %v\nOutput:\n%v", remoteErr, out)
 	}
 
+	if err := b.checkRelocations(client); err != nil {
+		return err
+	}
+
 	goCmd := path.Join(goDir, "bin/go")
 	if b.OS == "windows" {
 		goCmd += ".exe"
@@ -438,15 +445,18 @@ func (b *Build) make() error {
 		}
 	}
 
-	toolPaths := []string{
-		"golang.org/x/tools/cmd/godoc",
+	var toolPaths []string
+	if versionIncludesGodoc(*version) {
+		toolPaths = append(toolPaths, "golang.org/x/tools/cmd/godoc")
 	}
 	if versionIncludesTour(*version) {
 		toolPaths = append(toolPaths, "golang.org/x/tour")
 	}
-	b.logf("Building %v.", strings.Join(toolPaths, ", "))
-	if err := runGo(append([]string{"install"}, toolPaths...)...); err != nil {
-		return err
+	if len(toolPaths) > 0 {
+		b.logf("Building %v.", strings.Join(toolPaths, ", "))
+		if err := runGo(append([]string{"install"}, toolPaths...)...); err != nil {
+			return err
+		}
 	}
 
 	// postBuildCleanFiles are the list of files to remove in the go/ directory
@@ -701,6 +711,32 @@ func (b *Build) writeFile(name string, r io.Reader) error {
 	return nil
 }
 
+// checkRelocations runs readelf on pkg/linux_amd64/runtime/cgo.a and makes sure
+// we don't see R_X86_64_REX_GOTPCRELX. See issue 31293.
+func (b *Build) checkRelocations(client *buildlet.Client) error {
+	if b.OS != "linux" || b.Arch != "amd64" {
+		return nil
+	}
+	var out bytes.Buffer
+	file := fmt.Sprintf("go/pkg/linux_%s/runtime/cgo.a", b.Arch)
+	remoteErr, err := client.Exec("readelf", buildlet.ExecOpts{
+		Output:      &out,
+		Args:        []string{"-r", "--wide", file},
+		SystemLevel: true, // look for readelf in system's PATH
+	})
+	if err != nil {
+		return fmt.Errorf("failed to run readelf: %v", err)
+	}
+	got := out.String()
+	if strings.Contains(got, "R_X86_64_REX_GOTPCRELX") {
+		return fmt.Errorf("%s contained a R_X86_64_REX_GOTPCRELX relocation", file)
+	}
+	if !strings.Contains(got, "R_X86_64_GOTPCREL") {
+		return fmt.Errorf("%s did not contain a R_X86_64_GOTPCREL relocation; remoteErr=%v, %s", file, remoteErr, got)
+	}
+	return nil
+}
+
 // verifyGzipSingleStream verifies that the named gzip file is not
 // a multi-stream file. See golang.org/issue/19052
 func verifyGzipSingleStream(name string) error {
@@ -808,4 +844,14 @@ func versionIncludesTour(goVer string) bool {
 	// 1.12 and on, we won't ship the tour binary (see CL 131156).
 	return strings.HasPrefix(goVer, "go1.10.") ||
 		strings.HasPrefix(goVer, "go1.11.")
+}
+
+// versionIncludesGodoc reports whether the provided Go version (of the
+// form "go1.N" or "go1.N.M" includes the godoc binary.
+func versionIncludesGodoc(goVer string) bool {
+	// We don't do releases of Go 1.10 and earlier, so this only
+	// needs to recognize the two current past releases. From Go
+	// 1.13 and on, we won't ship the godoc binary (see Issue 30029).
+	return strings.HasPrefix(goVer, "go1.11.") ||
+		strings.HasPrefix(goVer, "go1.12.")
 }

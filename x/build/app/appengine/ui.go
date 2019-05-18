@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"golang.org/x/build/app/cache"
+	"golang.org/x/build/dashboard"
 	"golang.org/x/build/types"
 
 	"google.golang.org/appengine"
@@ -139,6 +140,25 @@ func uiHandler(w http.ResponseWriter, r *http.Request) {
 				tagState = append(tagState, s)
 			}
 		}
+		// Sort tagState in reverse lexical order by name so higher
+		// numbered release branches show first for subrepos
+		// https://build.golang.org/ after master. We want the subrepo
+		// order to be "master, release-branch.go1.12,
+		// release-branch.go1.11" so they're in order by date (newest
+		// first). If we weren't already at two digit minor versions we'd
+		// need to parse the branch name, but we can be lazy now
+		// and just do a string compare.
+		sort.Slice(tagState, func(i, j int) bool { // is item 'i' less than item 'j'?
+			ni, nj := tagState[i].Name, tagState[j].Name
+			switch {
+			case ni == "master":
+				return true // an i of "master" is always first
+			case nj == "master":
+				return false // if i wasn't "master", it can't be less than j's "master"
+			default:
+				return ni > nj // "release-branch.go1.12" > "release-branch.go1.11", so 1.12 sorts earlier
+			}
+		})
 
 	BuildData:
 		p := &Pagination{}
@@ -356,9 +376,14 @@ func commitBuilders(commits []*Commit) []string {
 			builders[r.Builder] = true
 		}
 	}
-	// In dev_appserver mode, add some dummy data:
-	if len(builders) == 0 && isDevAppServer {
-		return []string{"linux-amd64", "linux-amd64-nocgo", "linux-amd64-race", "windows-386", "windows-amd64"}
+	// Add all known builders from the builder configuration too.
+	// We want to see columns even if there are no results so we
+	// can identify missing builders. (Issue 19930)
+	for name, bc := range dashboard.Builders {
+		if !bc.BuildsRepoPostSubmit("go", "master", "master") {
+			continue
+		}
+		builders[name] = true
 	}
 	k := keys(builders)
 	sort.Sort(builderOrder(k))
@@ -366,6 +391,7 @@ func commitBuilders(commits []*Commit) []string {
 }
 
 func keys(m map[string]bool) (s []string) {
+	s = make([]string, 0, len(m))
 	for k := range m {
 		s = append(s, k)
 	}
