@@ -370,6 +370,10 @@ var entries = map[string]*Entry{
 		Primary:   []Owner{bradfitz, iant},
 		Secondary: []Owner{josharian},
 	},
+	"go/src/io": {
+		Primary:   []Owner{gri},
+		Secondary: []Owner{iant, bradfitz},
+	},
 	"go/src/log": {
 		Primary: []Owner{r},
 	},
@@ -513,6 +517,10 @@ var entries = map[string]*Entry{
 	"go/src/strconv": {
 		Primary: []Owner{rsc, gri, iant, bradfitz},
 	},
+	"go/src/strings": {
+		Primary:   []Owner{gri},
+		Secondary: []Owner{iant, bradfitz},
+	},
 	"go/src/sync": {
 		Primary: []Owner{rsc, iant, dvyukov, austin},
 	},
@@ -648,7 +656,8 @@ var entries = map[string]*Entry{
 		Primary: []Owner{rstambler, iancottrell},
 	},
 	"tools": {
-		Primary: []Owner{iancottrell},
+		Primary:   []Owner{iancottrell},
+		Secondary: []Owner{matloob},
 	},
 	"playground": {
 		Secondary: []Owner{ysmolsky},

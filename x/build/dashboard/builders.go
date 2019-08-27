@@ -448,6 +448,16 @@ var Hosts = map[string]*HostConfig{
 		env:            []string{"GOROOT_BOOTSTRAP=/root/go-solaris-amd64-bootstrap", "HOME=/root"},
 		ReverseAliases: []string{"solaris-amd64-smartosbuildlet"},
 	},
+	"host-illumos-amd64-joyent": &HostConfig{
+		Notes:     "run by Go team on Joyent, on a SmartOS 'infrastructure container'",
+		IsReverse: true,
+		ExpectNum: 1,
+		env: []string{
+			"GOROOT_BOOTSTRAP=/root/goboot",
+			"HOME=/root",
+			"PATH=/usr/sbin:/usr/bin:/opt/local/bin", // gcc is in /opt/local/bin
+		},
+	},
 	"host-solaris-oracle-amd64-oraclerel": &HostConfig{
 		Notes:       "Oracle Solaris amd64 Release System",
 		Owner:       "", // TODO: find current owner
@@ -1140,13 +1150,19 @@ func (c *HostConfig) PoolName() string {
 
 // ContainerVMImage returns the base VM name (not the fully qualified
 // URL resource name of the VM) that starts the konlet program that
-// pulls & runs a container. This method is only applicable when
-// c.IsContainer() is true.
+// pulls & runs a container.
+// The empty string means that no particular VM image is required
+// and the caller can run this container in any host.
+//
+// This method is only applicable when c.IsContainer() is true.
 func (c *HostConfig) ContainerVMImage() string {
 	if c.KonletVMImage != "" {
 		return c.KonletVMImage
 	}
-	return "debian-stretch-vmx"
+	if c.NestedVirt {
+		return "debian-stretch-vmx"
+	}
+	return ""
 }
 
 // IsHermetic reports whether this host config gets a fresh
@@ -2029,6 +2045,11 @@ func init() {
 		HostType: "host-solaris-amd64",
 	})
 	addBuilder(BuildConfig{
+		Name:             "illumos-amd64-joyent",
+		HostType:         "host-illumos-amd64-joyent",
+		MinimumGoVersion: types.MajorMinor{1, 13},
+	})
+	addBuilder(BuildConfig{
 		Name:     "linux-ppc64-buildlet",
 		HostType: "host-linux-ppc64-osu",
 		FlakyNet: true,
@@ -2173,7 +2194,7 @@ func init() {
 				// it ready by Go 1.13. See https://golang.org/issue/31564#issuecomment-484786144
 				return atLeastGo1(branch, 13) && atLeastGo1(goBranch, 13)
 			}
-			return atLeastGo1(branch, 12) && atLeastGo1(goBranch, 12)
+			return atLeastGo1(branch, 12) && atLeastGo1(goBranch, 12) && defaultBuildsRepoPolicy(repo, branch, goBranch)
 		},
 	})
 

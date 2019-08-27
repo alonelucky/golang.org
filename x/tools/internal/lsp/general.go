@@ -10,28 +10,49 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"strings"
 
 	"golang.org/x/tools/internal/jsonrpc2"
+	"golang.org/x/tools/internal/lsp/debug"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
+	"golang.org/x/tools/internal/telemetry/log"
+	"golang.org/x/tools/internal/telemetry/tag"
+	errors "golang.org/x/xerrors"
 )
 
 func (s *Server) initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
-	s.initializedMu.Lock()
-	defer s.initializedMu.Unlock()
-	if s.isInitialized {
+	s.stateMu.Lock()
+	state := s.state
+	s.stateMu.Unlock()
+	if state >= serverInitializing {
 		return nil, jsonrpc2.NewErrorf(jsonrpc2.CodeInvalidRequest, "server already initialized")
 	}
-	s.isInitialized = true // mark server as initialized now
+	s.stateMu.Lock()
+	s.state = serverInitializing
+	s.stateMu.Unlock()
 
-	// TODO(iancottrell): Change this default to protocol.Incremental and remove the option
-	s.textDocumentSyncKind = protocol.Full
+	// TODO: Remove the option once we are certain there are no issues here.
+	s.textDocumentSyncKind = protocol.Incremental
 	if opts, ok := params.InitializationOptions.(map[string]interface{}); ok {
-		if opt, ok := opts["incrementalSync"].(bool); ok && opt {
-			s.textDocumentSyncKind = protocol.Incremental
+		if opt, ok := opts["noIncrementalSync"].(bool); ok && opt {
+			s.textDocumentSyncKind = protocol.Full
 		}
+
+		// Check if user has enabled watching for file changes.
+		s.watchFileChanges, _ = opts["watchFileChanges"].(bool)
+	}
+
+	// Default to using synopsis as a default for hover information.
+	s.hoverKind = synopsisDocumentation
+
+	s.supportedCodeActions = map[source.FileKind]map[protocol.CodeActionKind]bool{
+		source.Go: {
+			protocol.SourceOrganizeImports: true,
+			protocol.QuickFix:              true,
+		},
+		source.Mod: {},
+		source.Sum: {},
 	}
 
 	s.setClientCapabilities(params.Capabilities)
@@ -47,7 +68,7 @@ func (s *Server) initialize(ctx context.Context, params *protocol.InitializePara
 			// no folders and no root, single file mode
 			//TODO(iancottrell): not sure how to do single file mode yet
 			//issue: golang.org/issue/31168
-			return nil, fmt.Errorf("single file mode not supported yet")
+			return nil, errors.Errorf("single file mode not supported yet")
 		}
 	}
 
@@ -56,7 +77,6 @@ func (s *Server) initialize(ctx context.Context, params *protocol.InitializePara
 			return nil, err
 		}
 	}
-
 	return &protocol.InitializeResult{
 		Capabilities: protocol.ServerCapabilities{
 			CodeActionProvider: true,
@@ -69,12 +89,17 @@ func (s *Server) initialize(ctx context.Context, params *protocol.InitializePara
 			HoverProvider:              true,
 			DocumentHighlightProvider:  true,
 			DocumentLinkProvider:       &protocol.DocumentLinkOptions{},
+			ReferencesProvider:         true,
+			RenameProvider:             true,
 			SignatureHelpProvider: &protocol.SignatureHelpOptions{
 				TriggerCharacters: []string{"(", ","},
 			},
 			TextDocumentSync: &protocol.TextDocumentSyncOptions{
 				Change:    s.textDocumentSyncKind,
 				OpenClose: true,
+				Save: &protocol.SaveOptions{
+					IncludeText: false,
+				},
 			},
 			TypeDefinitionProvider: true,
 			Workspace: &struct {
@@ -104,6 +129,7 @@ func (s *Server) setClientCapabilities(caps protocol.ClientCapabilities) {
 	// Check if the client supports configuration messages.
 	s.configurationSupported = caps.Workspace.Configuration
 	s.dynamicConfigurationSupported = caps.Workspace.DidChangeConfiguration.DynamicRegistration
+	s.dynamicWatchedFilesSupported = caps.Workspace.DidChangeWatchedFiles.DynamicRegistration
 
 	// Check which types of content format are supported by this client.
 	s.preferredContentFormat = protocol.PlainText
@@ -113,95 +139,186 @@ func (s *Server) setClientCapabilities(caps protocol.ClientCapabilities) {
 }
 
 func (s *Server) initialized(ctx context.Context, params *protocol.InitializedParams) error {
+	s.stateMu.Lock()
+	s.state = serverInitialized
+	s.stateMu.Unlock()
+
+	var registrations []protocol.Registration
+	if s.configurationSupported && s.dynamicConfigurationSupported {
+		registrations = append(registrations,
+			protocol.Registration{
+				ID:     "workspace/didChangeConfiguration",
+				Method: "workspace/didChangeConfiguration",
+			},
+			protocol.Registration{
+				ID:     "workspace/didChangeWorkspaceFolders",
+				Method: "workspace/didChangeWorkspaceFolders",
+			},
+		)
+	}
+
+	if s.watchFileChanges && s.dynamicWatchedFilesSupported {
+		registrations = append(registrations, protocol.Registration{
+			ID:     "workspace/didChangeWatchedFiles",
+			Method: "workspace/didChangeWatchedFiles",
+			RegisterOptions: protocol.DidChangeWatchedFilesRegistrationOptions{
+				Watchers: []protocol.FileSystemWatcher{{
+					GlobPattern: "**/*.go",
+					Kind:        float64(protocol.WatchChange),
+				}},
+			},
+		})
+	}
+
+	if len(registrations) > 0 {
+		s.client.RegisterCapability(ctx, &protocol.RegistrationParams{
+			Registrations: registrations,
+		})
+	}
+
 	if s.configurationSupported {
-		if s.dynamicConfigurationSupported {
-			s.client.RegisterCapability(ctx, &protocol.RegistrationParams{
-				Registrations: []protocol.Registration{{
-					ID:     "workspace/didChangeConfiguration",
-					Method: "workspace/didChangeConfiguration",
-				}, {
-					ID:     "workspace/didChangeWorkspaceFolders",
-					Method: "workspace/didChangeWorkspaceFolders",
-				}},
-			})
-		}
 		for _, view := range s.session.Views() {
-			config, err := s.client.Configuration(ctx, &protocol.ConfigurationParams{
-				Items: []protocol.ConfigurationItem{{
-					ScopeURI: protocol.NewURI(view.Folder()),
-					Section:  "gopls",
-				}},
-			})
-			if err != nil {
-				return err
-			}
-			if err := s.processConfig(view, config[0]); err != nil {
+			if err := s.fetchConfig(ctx, view); err != nil {
 				return err
 			}
 		}
 	}
 	buf := &bytes.Buffer{}
-	PrintVersionInfo(buf, true, false)
-	s.session.Logger().Infof(ctx, "%s", buf)
+	debug.PrintVersionInfo(buf, true, debug.PlainText)
+	log.Print(ctx, buf.String())
 	return nil
 }
 
-func (s *Server) processConfig(view source.View, config interface{}) error {
+func (s *Server) fetchConfig(ctx context.Context, view source.View) error {
+	configs, err := s.client.Configuration(ctx, &protocol.ConfigurationParams{
+		Items: []protocol.ConfigurationItem{{
+			ScopeURI: protocol.NewURI(view.Folder()),
+			Section:  "gopls",
+		}, {
+			ScopeURI: protocol.NewURI(view.Folder()),
+			Section:  view.Name(),
+		},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	for _, config := range configs {
+		if err := s.processConfig(ctx, view, config); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) processConfig(ctx context.Context, view source.View, config interface{}) error {
 	// TODO: We should probably store and process more of the config.
 	if config == nil {
 		return nil // ignore error if you don't have a config
 	}
+
 	c, ok := config.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("invalid config gopls type %T", config)
+		return errors.Errorf("invalid config gopls type %T", config)
 	}
+
 	// Get the environment for the go/packages config.
 	if env := c["env"]; env != nil {
 		menv, ok := env.(map[string]interface{})
 		if !ok {
-			return fmt.Errorf("invalid config gopls.env type %T", env)
+			return errors.Errorf("invalid config gopls.env type %T", env)
 		}
+		env := view.Env()
 		for k, v := range menv {
-			view.SetEnv(applyEnv(view.Config().Env, k, v))
+			env = append(env, fmt.Sprintf("%s=%s", k, v))
 		}
+		view.SetEnv(env)
+	}
+
+	// Get the build flags for the go/packages config.
+	if buildFlags := c["buildFlags"]; buildFlags != nil {
+		iflags, ok := buildFlags.([]interface{})
+		if !ok {
+			return errors.Errorf("invalid config gopls.buildFlags type %T", buildFlags)
+		}
+		flags := make([]string, 0, len(iflags))
+		for _, flag := range iflags {
+			flags = append(flags, fmt.Sprintf("%s", flag))
+		}
+		view.SetBuildFlags(flags)
+	}
+
+	// Check if the user wants documentation in completion items.
+	if wantCompletionDocumentation, ok := c["wantCompletionDocumentation"].(bool); ok {
+		s.wantCompletionDocumentation = wantCompletionDocumentation
 	}
 	// Check if placeholders are enabled.
 	if usePlaceholders, ok := c["usePlaceholders"].(bool); ok {
 		s.usePlaceholders = usePlaceholders
 	}
-	// Check if user has disabled documentation on hover.
-	if noDocsOnHover, ok := c["noDocsOnHover"].(bool); ok {
-		s.noDocsOnHover = noDocsOnHover
+	// Set the hover kind.
+	if hoverKind, ok := c["hoverKind"].(string); ok {
+		switch hoverKind {
+		case "NoDocumentation":
+			s.hoverKind = noDocumentation
+		case "SingleLine":
+			s.hoverKind = singleLine
+		case "SynopsisDocumentation":
+			s.hoverKind = synopsisDocumentation
+		case "FullDocumentation":
+			s.hoverKind = fullDocumentation
+		case "Structured":
+			s.hoverKind = structured
+		default:
+			log.Error(ctx, "unsupported hover kind", nil, tag.Of("HoverKind", hoverKind))
+			// The default value is already be set to synopsis.
+		}
 	}
+
+	// Check if the user wants to see suggested fixes from go/analysis.
+	if wantSuggestedFixes, ok := c["wantSuggestedFixes"].(bool); ok {
+		s.wantSuggestedFixes = wantSuggestedFixes
+	}
+
+	// Check if the user has explicitly disabled any analyses.
+	if disabledAnalyses, ok := c["experimentalDisabledAnalyses"].([]interface{}); ok {
+		s.disabledAnalyses = make(map[string]struct{})
+		for _, a := range disabledAnalyses {
+			if a, ok := a.(string); ok {
+				s.disabledAnalyses[a] = struct{}{}
+			}
+		}
+	}
+
+	// Check if deep completions are enabled.
+	if useDeepCompletions, ok := c["useDeepCompletions"].(bool); ok {
+		s.useDeepCompletions = useDeepCompletions
+	}
+
+	// Check if want unimported package completions.
+	if wantUnimportedCompletions, ok := c["wantUnimportedCompletions"].(bool); ok {
+		s.wantUnimportedCompletions = wantUnimportedCompletions
+	}
+
 	return nil
 }
 
-func applyEnv(env []string, k string, v interface{}) []string {
-	prefix := k + "="
-	value := prefix + fmt.Sprint(v)
-	for i, s := range env {
-		if strings.HasPrefix(s, prefix) {
-			env[i] = value
-			return env
-		}
-	}
-	return append(env, value)
-}
-
 func (s *Server) shutdown(ctx context.Context) error {
-	s.initializedMu.Lock()
-	defer s.initializedMu.Unlock()
-	if !s.isInitialized {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.state < serverInitialized {
 		return jsonrpc2.NewErrorf(jsonrpc2.CodeInvalidRequest, "server not initialized")
 	}
 	// drop all the active views
 	s.session.Shutdown(ctx)
-	s.isInitialized = false
+	s.state = serverShutDown
 	return nil
 }
 
 func (s *Server) exit(ctx context.Context) error {
-	if s.isInitialized {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.state != serverShutDown {
 		os.Exit(1)
 	}
 	os.Exit(0)

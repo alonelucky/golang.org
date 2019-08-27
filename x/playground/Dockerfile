@@ -9,37 +9,42 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl bzip2 ca-c
 RUN curl -s https://storage.googleapis.com/nativeclient-mirror/nacl/nacl_sdk/trunk.544461/naclsdk_linux.tar.bz2 | tar -xj -C /tmp --strip-components=2 pepper_67/tools/sel_ldr_x86_64
 
 FROM debian:stretch AS build
-LABEL maintainer "golang-dev@googlegroups.com"
+LABEL maintainer="golang-dev@googlegroups.com"
+
+ENV BUILD_DEPS 'curl git gcc patch libc6-dev ca-certificates'
+RUN apt-get update && apt-get install -y ${BUILD_DEPS} --no-install-recommends
 
 ENV GOPATH /go
 ENV PATH /usr/local/go/bin:$GOPATH/bin:$PATH
 ENV GOROOT_BOOTSTRAP /usr/local/gobootstrap
-ENV GO_VERSION 1.12.5
-ENV BUILD_DEPS 'curl git gcc patch libc6-dev ca-certificates'
+ENV GO_BOOTSTRAP_VERSION go1.12.6
+ARG GO_VERSION=go1.12.6
+ENV GO_VERSION ${GO_VERSION}
 
 # Fake time
 COPY enable-fake-time.patch /usr/local/playground/
 # Fake file system
 COPY fake_fs.lst /usr/local/playground/
 
-RUN apt-get update && apt-get install -y ${BUILD_DEPS} --no-install-recommends
-
-# Get the Go binary.
-RUN curl -sSL https://dl.google.com/go/go$GO_VERSION.linux-amd64.tar.gz -o /tmp/go.tar.gz
-RUN curl -sSL https://dl.google.com/go/go$GO_VERSION.linux-amd64.tar.gz.sha256 -o /tmp/go.tar.gz.sha256
+# Get a bootstrap version of Go for building from source.
+RUN curl -sSL https://dl.google.com/go/$GO_BOOTSTRAP_VERSION.linux-amd64.tar.gz -o /tmp/go.tar.gz
+RUN curl -sSL https://dl.google.com/go/$GO_BOOTSTRAP_VERSION.linux-amd64.tar.gz.sha256 -o /tmp/go.tar.gz.sha256
 RUN echo "$(cat /tmp/go.tar.gz.sha256) /tmp/go.tar.gz" | sha256sum -c -
-RUN tar -C /usr/local/ -vxzf /tmp/go.tar.gz
-# Make a copy for GOROOT_BOOTSTRAP, because we rebuild the toolchain and make.bash removes bin/go as its first step.
-RUN cp -R /usr/local/go $GOROOT_BOOTSTRAP
+RUN mkdir -p $GOROOT_BOOTSTRAP
+RUN tar --strip=1 -C $GOROOT_BOOTSTRAP -vxzf /tmp/go.tar.gz
+
+# Fetch Go source for tag $GO_VERSION.
+RUN git clone --depth=1 --branch=$GO_VERSION https://go.googlesource.com/go /usr/local/go
 # Apply the fake time and fake filesystem patches.
 RUN patch /usr/local/go/src/runtime/rt0_nacl_amd64p32.s /usr/local/playground/enable-fake-time.patch
-RUN cd /usr/local/go && go run misc/nacl/mkzip.go -p syscall /usr/local/playground/fake_fs.lst src/syscall/fstest_nacl.go
-# Re-build the Go toolchain.
+RUN cd /usr/local/go && $GOROOT_BOOTSTRAP/bin/go run misc/nacl/mkzip.go -p syscall /usr/local/playground/fake_fs.lst src/syscall/fstest_nacl.go
+# Build the Go toolchain.
 RUN cd /usr/local/go/src && GOOS=nacl GOARCH=amd64p32 ./make.bash --no-clean
 
 RUN mkdir /gocache
 ENV GOCACHE /gocache
 ENV GO111MODULE on
+ENV GOPROXY=https://proxy.golang.org
 
 COPY go.mod /go/src/playground/go.mod
 COPY go.sum /go/src/playground/go.sum

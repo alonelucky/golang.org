@@ -1,25 +1,26 @@
-// Copyright 2019q The Go Authors. All rights reserved.
+// Copyright 2019 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package tests
 
 import (
+	"bytes"
 	"context"
 	"flag"
+	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
 	"io/ioutil"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
+	"golang.org/x/tools/go/expect"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/packages/packagestest"
+	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/txtar"
@@ -28,16 +29,19 @@ import (
 // We hardcode the expected number of test cases to ensure that all tests
 // are being executed. If a test is added, this number must be changed.
 const (
-	ExpectedCompletionsCount       = 121
-	ExpectedCompletionSnippetCount = 14
-	ExpectedDiagnosticsCount       = 17
-	ExpectedFormatCount            = 5
-	ExpectedDefinitionsCount       = 35
+	ExpectedCompletionsCount       = 146
+	ExpectedCompletionSnippetCount = 15
+	ExpectedDiagnosticsCount       = 21
+	ExpectedFormatCount            = 6
+	ExpectedImportCount            = 2
+	ExpectedDefinitionsCount       = 39
 	ExpectedTypeDefinitionsCount   = 2
 	ExpectedHighlightsCount        = 2
+	ExpectedReferencesCount        = 5
+	ExpectedRenamesCount           = 20
 	ExpectedSymbolsCount           = 1
-	ExpectedSignaturesCount        = 20
-	ExpectedLinksCount             = 2
+	ExpectedSignaturesCount        = 21
+	ExpectedLinksCount             = 4
 )
 
 const (
@@ -54,11 +58,14 @@ type CompletionItems map[token.Pos]*source.CompletionItem
 type Completions map[span.Span][]token.Pos
 type CompletionSnippets map[span.Span]CompletionSnippet
 type Formats []span.Span
+type Imports []span.Span
 type Definitions map[span.Span]Definition
 type Highlights map[string][]span.Span
+type References map[span.Span][]span.Span
+type Renames map[span.Span]string
 type Symbols map[span.URI][]source.Symbol
 type SymbolsChildren map[string][]source.Symbol
-type Signatures map[span.Span]source.SignatureInformation
+type Signatures map[span.Span]*source.SignatureInformation
 type Links map[span.URI][]Link
 
 type Data struct {
@@ -69,8 +76,11 @@ type Data struct {
 	Completions        Completions
 	CompletionSnippets CompletionSnippets
 	Formats            Formats
+	Imports            Imports
 	Definitions        Definitions
 	Highlights         Highlights
+	References         References
+	Renames            Renames
 	Symbols            Symbols
 	symbolsChildren    SymbolsChildren
 	Signatures         Signatures
@@ -86,8 +96,11 @@ type Tests interface {
 	Diagnostics(*testing.T, Diagnostics)
 	Completion(*testing.T, Completions, CompletionSnippets, CompletionItems)
 	Format(*testing.T, Formats)
+	Import(*testing.T, Imports)
 	Definition(*testing.T, Definitions)
 	Highlight(*testing.T, Highlights)
+	Reference(*testing.T, References)
+	Rename(*testing.T, Renames)
 	Symbol(*testing.T, Symbols)
 	SignatureHelp(*testing.T, Signatures)
 	Link(*testing.T, Links)
@@ -108,14 +121,19 @@ type CompletionSnippet struct {
 }
 
 type Link struct {
-	Src    span.Span
-	Target string
+	Src          span.Span
+	Target       string
+	NotePosition token.Position
 }
 
 type Golden struct {
 	Filename string
 	Archive  *txtar.Archive
 	Modified bool
+}
+
+func Context(t testing.TB) context.Context {
+	return context.Background()
 }
 
 func Load(t testing.TB, exporter packagestest.Exporter, dir string) *Data {
@@ -128,6 +146,8 @@ func Load(t testing.TB, exporter packagestest.Exporter, dir string) *Data {
 		CompletionSnippets: make(CompletionSnippets),
 		Definitions:        make(Definitions),
 		Highlights:         make(Highlights),
+		References:         make(References),
+		Renames:            make(Renames),
 		Symbols:            make(Symbols),
 		symbolsChildren:    make(SymbolsChildren),
 		Signatures:         make(Signatures),
@@ -178,18 +198,20 @@ func Load(t testing.TB, exporter packagestest.Exporter, dir string) *Data {
 		filename := data.Exported.File(testModule, fragment)
 		data.fragments[filename] = fragment
 	}
+	data.Exported.Config.Logf = nil
 
 	// Merge the exported.Config with the view.Config.
 	data.Config = *data.Exported.Config
 	data.Config.Fset = token.NewFileSet()
-	data.Config.Context = context.Background()
+	data.Config.Logf = nil
+	data.Config.Context = Context(nil)
 	data.Config.ParseFile = func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
-		return parser.ParseFile(fset, filename, src, parser.AllErrors|parser.ParseComments)
+		panic("ParseFile should not be called")
 	}
 
 	// Do a first pass to collect special markers for completion.
 	if err := data.Exported.Expect(map[string]interface{}{
-		"item": func(name string, r packagestest.Range, _, _ string) {
+		"item": func(name string, r packagestest.Range, _ []string) {
 			data.Exported.Mark(name, r)
 		},
 	}); err != nil {
@@ -202,10 +224,13 @@ func Load(t testing.TB, exporter packagestest.Exporter, dir string) *Data {
 		"item":      data.collectCompletionItems,
 		"complete":  data.collectCompletions,
 		"format":    data.collectFormats,
+		"import":    data.collectImports,
 		"godef":     data.collectDefinitions,
 		"typdef":    data.collectTypeDefinitions,
 		"hover":     data.collectHoverDefinitions,
 		"highlight": data.collectHighlights,
+		"refs":      data.collectReferences,
+		"rename":    data.collectRenames,
 		"symbol":    data.collectSymbols,
 		"signature": data.collectSignatures,
 		"snippet":   data.collectCompletionSnippets,
@@ -256,18 +281,18 @@ func Run(t *testing.T, tests Tests, data *Data) {
 
 	t.Run("Format", func(t *testing.T) {
 		t.Helper()
-		if _, err := exec.LookPath("gofmt"); err != nil {
-			switch runtime.GOOS {
-			case "android":
-				t.Skip("gofmt is not installed")
-			default:
-				t.Fatal(err)
-			}
-		}
 		if len(data.Formats) != ExpectedFormatCount {
 			t.Errorf("got %v formats expected %v", len(data.Formats), ExpectedFormatCount)
 		}
 		tests.Format(t, data.Formats)
+	})
+
+	t.Run("Import", func(t *testing.T) {
+		t.Helper()
+		if len(data.Imports) != ExpectedImportCount {
+			t.Errorf("got %v imports expected %v", len(data.Imports), ExpectedImportCount)
+		}
+		tests.Import(t, data.Imports)
 	})
 
 	t.Run("Definition", func(t *testing.T) {
@@ -284,6 +309,22 @@ func Run(t *testing.T, tests Tests, data *Data) {
 			t.Errorf("got %v highlights expected %v", len(data.Highlights), ExpectedHighlightsCount)
 		}
 		tests.Highlight(t, data.Highlights)
+	})
+
+	t.Run("References", func(t *testing.T) {
+		t.Helper()
+		if len(data.References) != ExpectedReferencesCount {
+			t.Errorf("got %v references expected %v", len(data.References), ExpectedReferencesCount)
+		}
+		tests.Reference(t, data.References)
+	})
+
+	t.Run("Renames", func(t *testing.T) {
+		t.Helper()
+		if len(data.Renames) != ExpectedRenamesCount {
+			t.Errorf("got %v renames expected %v", len(data.Renames), ExpectedRenamesCount)
+		}
+		tests.Rename(t, data.Renames)
 	})
 
 	t.Run("Symbols", func(t *testing.T) {
@@ -382,17 +423,24 @@ func (data *Data) collectDiagnostics(spn span.Span, msgSource, msg string) {
 	if _, ok := data.Diagnostics[spn.URI()]; !ok {
 		data.Diagnostics[spn.URI()] = []source.Diagnostic{}
 	}
-	// If a file has an empty diagnostic message, return. This allows us to
-	// avoid testing diagnostics in files that may have a lot of them.
-	if msg == "" {
-		return
-	}
 	severity := source.SeverityError
 	if strings.Contains(string(spn.URI()), "analyzer") {
 		severity = source.SeverityWarning
 	}
+	// This is not the correct way to do this,
+	// but it seems excessive to do the full conversion here.
 	want := source.Diagnostic{
-		Span:     spn,
+		URI: spn.URI(),
+		Range: protocol.Range{
+			Start: protocol.Position{
+				Line:      float64(spn.Start().Line()) - 1,
+				Character: float64(spn.Start().Column()) - 1,
+			},
+			End: protocol.Position{
+				Line:      float64(spn.End().Line()) - 1,
+				Character: float64(spn.End().Column()) - 1,
+			},
+		},
 		Severity: severity,
 		Source:   msgSource,
 		Message:  msg,
@@ -400,20 +448,112 @@ func (data *Data) collectDiagnostics(spn span.Span, msgSource, msg string) {
 	data.Diagnostics[spn.URI()] = append(data.Diagnostics[spn.URI()], want)
 }
 
+// diffDiagnostics prints the diff between expected and actual diagnostics test
+// results.
+func DiffDiagnostics(uri span.URI, want, got []source.Diagnostic) string {
+	sortDiagnostics(want)
+	sortDiagnostics(got)
+
+	if len(got) != len(want) {
+		return summarizeDiagnostics(-1, want, got, "different lengths got %v want %v", len(got), len(want))
+	}
+	for i, w := range want {
+		g := got[i]
+		if w.Message != g.Message {
+			return summarizeDiagnostics(i, want, got, "incorrect Message got %v want %v", g.Message, w.Message)
+		}
+		if protocol.ComparePosition(w.Range.Start, g.Range.Start) != 0 {
+			return summarizeDiagnostics(i, want, got, "incorrect Start got %v want %v", g.Range.Start, w.Range.Start)
+		}
+		// Special case for diagnostics on parse errors.
+		if strings.Contains(string(uri), "noparse") {
+			if protocol.ComparePosition(g.Range.Start, g.Range.End) != 0 || protocol.ComparePosition(w.Range.Start, g.Range.End) != 0 {
+				return summarizeDiagnostics(i, want, got, "incorrect End got %v want %v", g.Range.End, w.Range.Start)
+			}
+		} else if !protocol.IsPoint(g.Range) { // Accept any 'want' range if the diagnostic returns a zero-length range.
+			if protocol.ComparePosition(w.Range.End, g.Range.End) != 0 {
+				return summarizeDiagnostics(i, want, got, "incorrect End got %v want %v", g.Range.End, w.Range.End)
+			}
+		}
+		if w.Severity != g.Severity {
+			return summarizeDiagnostics(i, want, got, "incorrect Severity got %v want %v", g.Severity, w.Severity)
+		}
+		if w.Source != g.Source {
+			return summarizeDiagnostics(i, want, got, "incorrect Source got %v want %v", g.Source, w.Source)
+		}
+	}
+	return ""
+}
+
+func sortDiagnostics(d []source.Diagnostic) {
+	sort.Slice(d, func(i int, j int) bool {
+		return compareDiagnostic(d[i], d[j]) < 0
+	})
+}
+
+func compareDiagnostic(a, b source.Diagnostic) int {
+	if r := span.CompareURI(a.URI, b.URI); r != 0 {
+		return r
+	}
+	if r := protocol.CompareRange(a.Range, b.Range); r != 0 {
+		return r
+	}
+	if a.Message < b.Message {
+		return -1
+	}
+	if a.Message == b.Message {
+		return 0
+	} else {
+		return 1
+	}
+}
+
+func summarizeDiagnostics(i int, want []source.Diagnostic, got []source.Diagnostic, reason string, args ...interface{}) string {
+	msg := &bytes.Buffer{}
+	fmt.Fprint(msg, "diagnostics failed")
+	if i >= 0 {
+		fmt.Fprintf(msg, " at %d", i)
+	}
+	fmt.Fprint(msg, " because of ")
+	fmt.Fprintf(msg, reason, args...)
+	fmt.Fprint(msg, ":\nexpected:\n")
+	for _, d := range want {
+		fmt.Fprintf(msg, "  %s:%v: %s\n", d.URI, d.Range, d.Message)
+	}
+	fmt.Fprintf(msg, "got:\n")
+	for _, d := range got {
+		fmt.Fprintf(msg, "  %s:%v: %s\n", d.URI, d.Range, d.Message)
+	}
+	return msg.String()
+}
+
 func (data *Data) collectCompletions(src span.Span, expected []token.Pos) {
 	data.Completions[src] = expected
 }
 
-func (data *Data) collectCompletionItems(pos token.Pos, label, detail, kind string) {
+func (data *Data) collectCompletionItems(pos token.Pos, args []string) {
+	if len(args) < 3 {
+		return
+	}
+	label, detail, kind := args[0], args[1], args[2]
+	var documentation string
+	if len(args) == 4 {
+		documentation = args[3]
+	}
 	data.CompletionItems[pos] = &source.CompletionItem{
-		Label:  label,
-		Detail: detail,
-		Kind:   source.ParseCompletionItemKind(kind),
+		Label:         label,
+		Detail:        detail,
+		Kind:          source.ParseCompletionItemKind(kind),
+		Documentation: documentation,
 	}
 }
 
 func (data *Data) collectFormats(spn span.Span) {
 	data.Formats = append(data.Formats, spn)
+}
+
+func (data *Data) collectImports(spn span.Span) {
+	data.Imports = append(data.Imports, spn)
 }
 
 func (data *Data) collectDefinitions(src, target span.Span) {
@@ -449,6 +589,14 @@ func (data *Data) collectHighlights(name string, rng span.Span) {
 	data.Highlights[name] = append(data.Highlights[name], rng)
 }
 
+func (data *Data) collectReferences(src span.Span, expected []span.Span) {
+	data.References[src] = expected
+}
+
+func (data *Data) collectRenames(src span.Span, newText string) {
+	data.Renames[src] = newText
+}
+
 func (data *Data) collectSymbols(name string, spn span.Span, kind string, parentName string) {
 	sym := source.Symbol{
 		Name:          name,
@@ -463,9 +611,13 @@ func (data *Data) collectSymbols(name string, spn span.Span, kind string, parent
 }
 
 func (data *Data) collectSignatures(spn span.Span, signature string, activeParam int64) {
-	data.Signatures[spn] = source.SignatureInformation{
+	data.Signatures[spn] = &source.SignatureInformation{
 		Label:           signature,
 		ActiveParameter: int(activeParam),
+	}
+	// Hardcode special case to test the lack of a signature.
+	if signature == "" && activeParam == 0 {
+		data.Signatures[spn] = nil
 	}
 }
 
@@ -477,10 +629,12 @@ func (data *Data) collectCompletionSnippets(spn span.Span, item token.Pos, plain
 	}
 }
 
-func (data *Data) collectLinks(spn span.Span, link string) {
+func (data *Data) collectLinks(spn span.Span, link string, note *expect.Note, fset *token.FileSet) {
+	position := fset.Position(note.Pos)
 	uri := spn.URI()
 	data.Links[uri] = append(data.Links[uri], Link{
-		Src:    spn,
-		Target: link,
+		Src:          spn,
+		Target:       link,
+		NotePosition: position,
 	})
 }

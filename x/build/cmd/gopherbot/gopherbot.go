@@ -52,6 +52,10 @@ var (
 	onlyRun = flag.String("only-run", "", "if non-empty, the name of a task to run. Mostly for debugging, but tasks (like 'kicktrain') may choose to only run in explicit mode")
 )
 
+const (
+	gopherbotGitHubID = 8566911
+)
+
 // GitHub Label IDs for the golang/go repo.
 const (
 	needsDecisionID      = 373401956
@@ -280,7 +284,7 @@ var tasks = []struct {
 	{"label build issues", (*gopherbot).labelBuildIssues},
 	{"label mobile issues", (*gopherbot).labelMobileIssues},
 	{"label documentation issues", (*gopherbot).labelDocumentationIssues},
-	{"label gopls issues", (*gopherbot).labelGoplsIssues},
+	{"handle gopls issues", (*gopherbot).handleGoplsIssues},
 	{"close stale WaitingForInfo", (*gopherbot).closeStaleWaitingForInfo},
 	{"cl2issue", (*gopherbot).cl2issue},
 	{"update needs", (*gopherbot).updateNeeds},
@@ -292,6 +296,7 @@ var tasks = []struct {
 	{"apply labels from comments", (*gopherbot).applyLabelsFromComments},
 	{"assign reviewers to CLs", (*gopherbot).assignReviewersToCLs},
 	{"abandon scratch reviews", (*gopherbot).abandonScratchReviews},
+	{"access", (*gopherbot).whoNeedsAccess},
 }
 
 func (b *gopherbot) initCorpus() {
@@ -749,8 +754,35 @@ func (b *gopherbot) labelProposals(ctx context.Context) error {
 				return err
 			}
 		}
+
+		// Remove NeedsDecision label if exists:
+		if gi.HasLabel("NeedsDecision") && !gopherbotRemovedLabel(gi, "NeedsDecision") {
+			if err := b.removeLabel(ctx, gi, "NeedsDecision"); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
+}
+
+// gopherbotRemovedLabel reports whether gopherbot has
+// previously removed label in the GitHub issue gi.
+//
+// Note that until golang.org/issue/28226 is resolved,
+// there's a brief delay before maintner catches up on
+// GitHub issue events and learns that it has happened.
+func gopherbotRemovedLabel(gi *maintner.GitHubIssue, label string) bool {
+	var hasRemoved bool
+	gi.ForeachEvent(func(e *maintner.GitHubIssueEvent) error {
+		if e.Actor != nil && e.Actor.ID == gopherbotGitHubID &&
+			e.Type == "unlabeled" &&
+			e.Label == label {
+			hasRemoved = true
+			return errStopIteration
+		}
+		return nil
+	})
+	return hasRemoved
 }
 
 func (b *gopherbot) setSubrepoMilestones(ctx context.Context) error {
@@ -833,12 +865,23 @@ func (b *gopherbot) labelDocumentationIssues(ctx context.Context) error {
 	})
 }
 
-func (b *gopherbot) labelGoplsIssues(ctx context.Context) error {
+// handleGoplsIssues labels and asks for additional information on gopls issues.
+//
+// This is necessary because gopls issues often require additional information to diagnose,
+// and we don't ask for this information in the Go issue template.
+func (b *gopherbot) handleGoplsIssues(ctx context.Context) error {
 	return b.gorepo.ForeachIssue(func(gi *maintner.GitHubIssue) error {
 		if gi.Closed || gi.PullRequest || !isGoplsTitle(gi.Title) || gi.HasLabel("gopls") || gi.HasEvent("unlabeled") {
 			return nil
 		}
-		return b.addLabel(ctx, gi, "gopls")
+		if err := b.addLabel(ctx, gi, "gopls"); err != nil {
+			return err
+		}
+		// Request more information from the user.
+		const comment = "Thank you for filing a gopls issue! Please take a look at the " +
+			"[Troubleshooting](https://github.com/golang/go/wiki/gopls#troubleshooting) section of the gopls Wiki page, " +
+			"and make sure that you have provided all of the relevant information here."
+		return b.addGitHubComment(ctx, "golang", "go", gi.Number, comment)
 	})
 }
 
@@ -1755,6 +1798,71 @@ func (b *gopherbot) abandonScratchReviews(ctx context.Context) error {
 			return err
 		})
 	})
+}
+
+func (b *gopherbot) whoNeedsAccess(ctx context.Context) error {
+	// We only run this task if it was explicitly requested via
+	// the --only-run flag.
+	if *onlyRun == "" {
+		return nil
+	}
+	level := map[int64]int{} // gerrit id -> 1 for try, 2 for submit
+	ais, err := b.gerrit.GetGroupMembers(ctx, "may-start-trybots")
+	if err != nil {
+		return err
+	}
+	for _, ai := range ais {
+		level[ai.NumericID] = 1
+	}
+	ais, err = b.gerrit.GetGroupMembers(ctx, "approvers")
+	if err != nil {
+		return err
+	}
+	for _, ai := range ais {
+		level[ai.NumericID] = 2
+	}
+
+	quarterAgo := time.Now().Add(-90 * 24 * time.Hour)
+	missing := map[string]int{} // "only level N: $WHO" -> number of CLs for that user
+	err = b.corpus.Gerrit().ForeachProjectUnsorted(func(gp *maintner.GerritProject) error {
+		if gp.Server() != "go.googlesource.com" {
+			return nil
+		}
+		return gp.ForeachCLUnsorted(func(cl *maintner.GerritCL) error {
+			if cl.Meta.Commit.AuthorTime.Before(quarterAgo) {
+				return nil
+			}
+			authorID := int64(cl.OwnerID())
+			if authorID == -1 {
+				return nil
+			}
+			if level[authorID] == 2 {
+				return nil
+			}
+			missing[fmt.Sprintf("only level %d: %v", level[authorID], cl.Commit.Author)]++
+			return nil
+		})
+	})
+	if err != nil {
+		return err
+	}
+	var people []string
+	for who := range missing {
+		people = append(people, who)
+	}
+	sort.Slice(people, func(i, j int) bool { return missing[people[j]] < missing[people[i]] })
+	fmt.Println("Number of CLs created in last 90 days | Access (0=none, 1=trybots) | Author")
+	for i, who := range people {
+		num := missing[who]
+		if num < 3 {
+			break
+		}
+		fmt.Printf("%3d: %s\n", num, who)
+		if i == 20 {
+			break
+		}
+	}
+	return nil
 }
 
 // humanReviewersOnChange returns true if there are (or were any) human reviewers in the given change.

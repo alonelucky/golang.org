@@ -25,14 +25,26 @@ func main() {
 	{
 		w := &bytes.Buffer{}
 		w.WriteString(header)
-		w.WriteString(headerComment)
-		write(w, build(modeCodes[:], 0), "modeTable",
-			"// modeTable represents Table 1 and the End-of-Line code.\n")
-		write(w, build(whiteCodes[:], 0), "whiteTable",
-			"// whiteTable represents Tables 2 and 3 for a white run.\n")
-		write(w, build(blackCodes[:], 0), "blackTable",
-			"// blackTable represents Tables 2 and 3 for a black run.\n")
+		w.WriteString(decodeHeaderComment)
+		writeDecodeTable(w, build(modeCodes[:], 0), "modeDecodeTable",
+			"// modeDecodeTable represents Table 1 and the End-of-Line code.\n")
+		writeDecodeTable(w, build(whiteCodes[:], 0), "whiteDecodeTable",
+			"// whiteDecodeTable represents Tables 2 and 3 for a white run.\n")
+		writeDecodeTable(w, build(blackCodes[:], 0), "blackDecodeTable",
+			"// blackDecodeTable represents Tables 2 and 3 for a black run.\n")
 		writeMaxCodeLength(w, modeCodes[:], whiteCodes[:], blackCodes[:])
+		w.WriteString(encodeHeaderComment)
+		w.WriteString(bitStringTypeDef)
+		writeEncodeTable(w, modeCodes[:], "modeEncodeTable",
+			"// modeEncodeTable represents Table 1 and the End-of-Line code.\n")
+		writeEncodeTable(w, whiteCodes[:64], "whiteEncodeTable2",
+			"// whiteEncodeTable2 represents Table 2 for a white run.\n")
+		writeEncodeTable(w, whiteCodes[64:], "whiteEncodeTable3",
+			"// whiteEncodeTable3 represents Table 3 for a white run.\n")
+		writeEncodeTable(w, blackCodes[:64], "blackEncodeTable2",
+			"// blackEncodeTable2 represents Table 2 for a black run.\n")
+		writeEncodeTable(w, blackCodes[64:], "blackEncodeTable3",
+			"// blackEncodeTable3 represents Table 3 for a black run.\n")
 		finish(w, "table.go")
 	}
 
@@ -50,10 +62,10 @@ package ccitt
 
 `
 
-const headerComment = `
-// Each table is represented by an array of [2]int16's: a binary tree. Each
-// array element (other than element 0, which means invalid) is a branch node
-// in that tree. The root node is always element 1 (the second element).
+const decodeHeaderComment = `
+// Each decodeTable is represented by an array of [2]int16's: a binary tree.
+// Each array element (other than element 0, which means invalid) is a branch
+// node in that tree. The root node is always element 1 (the second element).
 //
 // To walk the tree, look at the next bit in the bit stream, using it to select
 // the first or second element of the [2]int16. If that int16 is 0, we have an
@@ -61,22 +73,28 @@ const headerComment = `
 // then we have a leaf node, whose value is the bitwise complement (the ^
 // operator) of that int16.
 //
-// Comments above each table also show the same structure visually. The "b123"
-// lines show the 123'rd branch node. The "=XXXXX" lines show an invalid code.
-// The "=v1234" lines show a leaf node with value 1234. When reading the bit
-// stream, a 0 or 1 bit means to go up or down, as you move left to right.
+// Comments above each decodeTable also show the same structure visually. The
+// "b123" lines show the 123'rd branch node. The "=XXXXX" lines show an invalid
+// code. The "=v1234" lines show a leaf node with value 1234. When reading the
+// bit stream, a 0 or 1 bit means to go up or down, as you move left to right.
 //
-// For example, in modeTable, branch node b005 is three steps up from the root
-// node, meaning that we have already seen "000". If the next bit is "0" then
-// we move to branch node b006. Otherwise, the next bit is "1", and we move to
-// the leaf node v0000 (also known as the modePass constant). Indeed, the bits
-// that encode modePass are "0001".
+// For example, in modeDecodeTable, branch node b005 is three steps up from the
+// root node, meaning that we have already seen "000". If the next bit is "0"
+// then we move to branch node b006. Otherwise, the next bit is "1", and we
+// move to the leaf node v0000 (also known as the modePass constant). Indeed,
+// the bits that encode modePass are "0001".
 //
 // Tables 1, 2 and 3 come from the "ITU-T Recommendation T.6: FACSIMILE CODING
 // SCHEMES AND CODING CONTROL FUNCTIONS FOR GROUP 4 FACSIMILE APPARATUS"
 // specification:
 //
 // https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-T.6-198811-I!!PDF-E&type=items
+
+
+`
+
+const encodeHeaderComment = `
+// Each encodeTable is represented by an array of bitStrings.
 
 
 `
@@ -128,7 +146,7 @@ func build(codes []code, prefixLen int) *node {
 	}
 }
 
-func write(w *bytes.Buffer, root *node, varName string, comment string) {
+func writeDecodeTable(w *bytes.Buffer, root *node, varName, comment string) {
 	assignBranchIndexes(root)
 
 	w.WriteString(comment)
@@ -148,6 +166,32 @@ func write(w *bytes.Buffer, root *node, varName string, comment string) {
 		}
 	}
 
+	fmt.Fprintf(w, "}\n\n")
+}
+
+const bitStringTypeDef = `
+// bitString is a pair of uint32 values representing a bit code.
+// The nBits low bits of bits make up the actual bit code.
+// Eg. bitString{0x0004, 8} represents the bitcode "00000100".
+type bitString struct {
+	bits  uint32
+	nBits uint32
+}
+
+`
+
+func writeEncodeTable(w *bytes.Buffer, codes []code, varName, comment string) {
+	w.WriteString(comment)
+	fmt.Fprintf(w, "var %s = [...]bitString{\n", varName)
+	for i, code := range codes {
+		s := code.str
+		n := uint32(len(s))
+		c := uint32(0)
+		for j := uint32(0); j < n; j++ {
+			c |= uint32(s[j]&1) << (n - j - 1)
+		}
+		fmt.Fprintf(w, "%d: {0x%04x, %v}, // %q \n", i, c, n, s)
+	}
 	fmt.Fprintf(w, "}\n\n")
 }
 

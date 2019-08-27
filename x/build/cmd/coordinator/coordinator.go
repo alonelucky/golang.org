@@ -670,7 +670,11 @@ func serveTryStatusHTML(w http.ResponseWriter, ts *trySet, tss trySetState) {
 			if bs.succeeded {
 				status = "pass"
 			} else {
-				status = "<b>FAIL</b>"
+				if u := bs.failURL; u != "" {
+					status = fmt.Sprintf("<a href='%s'><b>FAIL</b></a>", html.EscapeString(u))
+				} else {
+					status = "<b>FAIL</b>"
+				}
 			}
 		} else {
 			status = fmt.Sprintf("<i>running</i> %s", time.Since(bs.startTime).Round(time.Second))
@@ -3212,6 +3216,9 @@ func (st *buildStatus) HTMLStatusLine() template.HTML      { return st.htmlStatu
 func (st *buildStatus) HTMLStatusLine_done() template.HTML { return st.htmlStatusLine(false) }
 
 func (st *buildStatus) htmlStatusLine(full bool) template.HTML {
+	if st == nil {
+		return "[nil]"
+	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -3239,9 +3246,9 @@ func (st *buildStatus) htmlStatusLine(full bool) template.HTML {
 		state = "<font color='#700000'>failed</font>"
 	}
 	if full {
-		fmt.Fprintf(&buf, "; <a href='%s'>%s</a>; %s", st.logsURLLocked(), state, html.EscapeString(st.bc.String()))
+		fmt.Fprintf(&buf, "; <a href='%s'>%s</a>; %s", html.EscapeString(st.logsURLLocked()), state, html.EscapeString(st.bc.String()))
 	} else {
-		fmt.Fprintf(&buf, "; <a href='%s'>%s</a>", st.logsURLLocked(), state)
+		fmt.Fprintf(&buf, "; <a href='%s'>%s</a>", html.EscapeString(st.logsURLLocked()), state)
 	}
 
 	t := st.done
@@ -3257,6 +3264,9 @@ func (st *buildStatus) htmlStatusLine(full bool) template.HTML {
 }
 
 func (st *buildStatus) logsURLLocked() string {
+	if st.failURL != "" {
+		return st.failURL
+	}
 	var urlPrefix string
 	if buildEnv == buildenv.Production {
 		urlPrefix = "https://farmer.golang.org"
@@ -3282,7 +3292,7 @@ func (st *buildStatus) writeEventsLocked(w io.Writer, htmlMode bool) {
 		text := evt.text
 		if htmlMode {
 			if e == "running_exec" {
-				e = fmt.Sprintf("<a href='%s'>%s</a>", st.logsURLLocked(), e)
+				e = fmt.Sprintf("<a href='%s'>%s</a>", html.EscapeString(st.logsURLLocked()), e)
 			}
 			e = "<b>" + e + "</b>"
 			text = "<i>" + html.EscapeString(text) + "</i>"

@@ -34,7 +34,7 @@ WORKDIR /go/src/golang.org/x/build/
 COPY . /go/src/golang.org/x/build/
 RUN go install golang.org/x/build/cmd/gitmirror
 
-FROM debian:stretch
+FROM debian:buster
 LABEL maintainer "golang-dev@googlegroups.com"
 
 # For interacting with the Go source & subrepos
@@ -54,7 +54,7 @@ RUN gpg --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys 595E85A6B1B
  && gpg --verify /tini.asc
 RUN chmod +x /tini
 
-# Add Github.com's known_hosts entries, so git push calls later don't
+# Add github.com's known_hosts entries, so git push calls later don't
 # prompt, and don't need to have their strict host key checking
 # disabled.
 RUN mkdir -p ~/.ssh/ \

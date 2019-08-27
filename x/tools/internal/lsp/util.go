@@ -6,70 +6,33 @@ package lsp
 
 import (
 	"context"
-	"fmt"
-	"io"
-	"os/exec"
 
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
+	errors "golang.org/x/xerrors"
 )
 
-// This writes the version and environment information to a writer.
-func PrintVersionInfo(w io.Writer, verbose bool, markdown bool) {
-	if !verbose {
-		printBuildInfo(w, false)
-		return
-	}
-	fmt.Fprint(w, "#### Build info\n\n")
-	if markdown {
-		fmt.Fprint(w, "```\n")
-	}
-	printBuildInfo(w, true)
-	fmt.Fprint(w, "\n")
-	if markdown {
-		fmt.Fprint(w, "```\n")
-	}
-	fmt.Fprint(w, "\n#### Go info\n\n")
-	if markdown {
-		fmt.Fprint(w, "```\n")
-	}
-	cmd := exec.Command("go", "version")
-	cmd.Stdout = w
-	cmd.Run()
-	fmt.Fprint(w, "\n")
-	cmd = exec.Command("go", "env")
-	cmd.Stdout = w
-	cmd.Run()
-	if markdown {
-		fmt.Fprint(w, "```\n")
-	}
-}
-
-func getSourceFile(ctx context.Context, v source.View, uri span.URI) (source.File, *protocol.ColumnMapper, error) {
-	f, err := v.GetFile(ctx, uri)
+func getGoFile(ctx context.Context, view source.View, uri span.URI) (source.GoFile, error) {
+	f, err := view.GetFile(ctx, uri)
 	if err != nil {
-		return nil, nil, err
-	}
-
-	fname, err := f.URI().Filename()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	m := protocol.NewColumnMapper(f.URI(), fname, f.GetFileSet(ctx), f.GetToken(ctx), f.GetContent(ctx))
-
-	return f, m, nil
-}
-
-func getGoFile(ctx context.Context, v source.View, uri span.URI) (source.GoFile, *protocol.ColumnMapper, error) {
-	f, m, err := getSourceFile(ctx, v, uri)
-	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	gof, ok := f.(source.GoFile)
 	if !ok {
-		return nil, nil, fmt.Errorf("not a go file %v", f.URI())
+		return nil, errors.Errorf("%s is not a Go file", uri)
 	}
-	return gof, m, nil
+	return gof, nil
+}
+
+func getMapper(ctx context.Context, f source.File) (*protocol.ColumnMapper, error) {
+	data, _, err := f.Handle(ctx).Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tok, err := f.GetToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return protocol.NewColumnMapper(f.URI(), f.URI().Filename(), f.FileSet(), tok, data), nil
 }

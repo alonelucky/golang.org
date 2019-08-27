@@ -6,13 +6,14 @@ package source
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
 
 	"golang.org/x/tools/internal/span"
+	"golang.org/x/tools/internal/telemetry/trace"
+	errors "golang.org/x/xerrors"
 )
 
 type SymbolKind int
@@ -40,10 +41,19 @@ type Symbol struct {
 	Children      []Symbol
 }
 
-func DocumentSymbols(ctx context.Context, f GoFile) []Symbol {
-	fset := f.GetFileSet(ctx)
-	file := f.GetAST(ctx)
-	pkg := f.GetPackage(ctx)
+func DocumentSymbols(ctx context.Context, f GoFile) ([]Symbol, error) {
+	ctx, done := trace.StartSpan(ctx, "source.DocumentSymbols")
+	defer done()
+
+	fset := f.FileSet()
+	file, err := f.GetAST(ctx, ParseFull)
+	if file == nil {
+		return nil, err
+	}
+	pkg, err := f.GetPackage(ctx)
+	if err != nil {
+		return nil, err
+	}
 	info := pkg.GetTypesInfo()
 	q := qualifier(file, pkg.GetTypes(), info)
 
@@ -96,8 +106,7 @@ func DocumentSymbols(ctx context.Context, f GoFile) []Symbol {
 			symbols = append(symbols, methods...)
 		}
 	}
-
-	return symbols
+	return symbols, nil
 }
 
 func funcSymbol(decl *ast.FuncDecl, obj types.Object, fset *token.FileSet, q types.Qualifier) Symbol {

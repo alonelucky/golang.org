@@ -2,10 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build appengine
-
-// Package appengine contains an AppEngine app for perfdata.golang.org
-package appengine
+// This binary contains an App Engine app for perfdata.golang.org
+package main
 
 import (
 	"errors"
@@ -35,9 +33,15 @@ func connectDB() (*db.DB, error) {
 		user           = mustGetenv("CLOUDSQL_USER")
 		password       = os.Getenv("CLOUDSQL_PASSWORD") // NOTE: password may be empty
 		dbName         = mustGetenv("CLOUDSQL_DATABASE")
+		socket         = os.Getenv("CLOUDSQL_SOCKET_PREFIX")
 	)
 
-	return db.OpenSQL("mysql", fmt.Sprintf("%s:%s@cloudsql(%s)/%s?interpolateParams=true", user, password, connectionName, dbName))
+	// /cloudsql is used on App Engine.
+	if socket == "" {
+		socket = "/cloudsql"
+	}
+
+	return db.OpenSQL("mysql", fmt.Sprintf("%s:%s@unix(%s/%s)/%s", user, password, socket, connectionName, dbName))
 }
 
 func mustGetenv(k string) string {
@@ -148,6 +152,7 @@ func appHandler(w http.ResponseWriter, r *http.Request) {
 	mux.ServeHTTP(w, r)
 }
 
-func init() {
+func main() {
 	http.HandleFunc("/", appHandler)
+	appengine.Main()
 }
