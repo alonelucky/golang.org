@@ -20,13 +20,13 @@ require (
 	github.com/kr/pty v1.1.3
 	github.com/tarm/serial v0.0.0-20180830185346-98f6abe2eb07
 	go4.org v0.0.0-20180809161055-417644f6feb5
-	golang.org/x/crypto v0.0.0-20190424203555-c05e17bb3b2d
-	golang.org/x/net v0.0.0-20190502183928-7f726cade0ab
+	golang.org/x/crypto v0.1.0
+	golang.org/x/net v0.1.0
 	golang.org/x/oauth2 v0.0.0-20190402181905-9f3314589c9a
 	golang.org/x/perf v0.0.0-20180704124530-6e6d33e29852
-	golang.org/x/sync v0.0.0-20190423024810-112230192c58
-	golang.org/x/sys v0.0.0-20190502175342-a43fa875dd82
-	golang.org/x/text v0.3.2
+	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4
+	golang.org/x/sys v0.1.0
+	golang.org/x/text v0.4.0
 	golang.org/x/time v0.0.0-20190308202827-9d24e82272b4
 	google.golang.org/api v0.4.0
 	google.golang.org/appengine v1.5.0
